@@ -45,11 +45,21 @@ def main() -> None:
             xs = [e["step"] for e in train_entries]
             ys = [e["loss"] for e in train_entries]
             ax.plot(xs, ys, alpha=0.3, label=f"{run} (train)")
-        # eval: bold lines for val
+        # eval: bold line for the primary val (dense for csa, plain for vanilla)
         if eval_entries:
             xs = [e["step"] for e in eval_entries]
             ys = [e["val_loss"] for e in eval_entries]
-            ax.plot(xs, ys, marker="o", linewidth=2, label=f"{run} (val)")
+            label = f"{run} (val)"
+            if any("val_loss_topk" in e for e in eval_entries):
+                label = f"{run} (val dense)"
+            ax.plot(xs, ys, marker="o", linewidth=2, label=label)
+            # If top-k metrics are present (Stage 3+), plot them with a dashed
+            # marker so the train/eval mismatch is visible at a glance.
+            topk = [(e["step"], e["val_loss_topk"]) for e in eval_entries if "val_loss_topk" in e]
+            if topk:
+                tx, ty = zip(*topk)
+                ax.plot(tx, ty, marker="s", linewidth=2, linestyle="--",
+                        label=f"{run} (val top-k)")
 
     ax.set_xlabel("step")
     ax.set_ylabel("cross-entropy loss")

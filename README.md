@@ -16,61 +16,75 @@ Built incrementally; each stage is committed in a runnable state.
 
 - [x] **Stage 1** — vanilla decoder-only transformer baseline.
 - [x] **Stage 2** — CSA compression (eqs. 9–12) with dense attention over all C^Comp blocks.
-- [ ] Stage 3 — Lightning indexer (eqs. 13–17).
+- [x] **Stage 3** — Lightning indexer (eqs. 13–17) with dense-train / top-k-eval (D3).
 - [ ] Stage 4 — Shared-KV MQA (eqs. 18–19).
 
 ## Results
 
-Both runs use the same architecture skeleton: `d_model=384`, 6 layers, 6 heads
+All runs share the same architecture skeleton: `d_model=384`, 6 layers, 6 heads
 (`head_dim=64`), `block_size=1024`, `batch_size=32`, AdamW lr 3e-4 → 3e-5
 cosine schedule, 100-step warmup, 3000 iters, char-level TinyShakespeare,
 tied LM head. The only thing that varies is the attention block.
 
-CSA Stage 2 uses `m=4`, `c=64` (= head_dim), so the KV cache is compressed
-4× along the sequence dimension. Queries attend densely over all causally-
-valid compressed blocks (no indexer or top-k yet — that arrives Stage 3).
+CSA shared config: `m=4`, `c=64` (= head_dim) so the KV cache is compressed
+4× along the sequence dimension (`n_blk=256` for `block_size=1024`).
 
-| metric                          | baseline-v1   | csa-stage2-v1   |
-| ------------------------------- | ------------- | --------------- |
-| init loss                       | 4.18          | 4.18 (= ln 65)  |
-| **min val loss (step)**         | **1.585 (1000)** | **1.977 (1500)** |
-| final train loss (step 3000)    | 0.151         | 1.378           |
-| final val loss (step 3000)      | 3.116         | **2.101**       |
-| train/val gap @ step 3000       | 2.965 nats    | **0.723 nats**  |
-| params (excl embeddings)        | ~10.7M        | ~10.5M          |
-| throughput                      | 217K tok/s    | 192K tok/s\*    |
-| wall time                       | 528 s         | 589 s           |
+| metric                          | baseline-v1     | csa-stage2-v1   | csa-stage3-v1            |
+| ------------------------------- | --------------- | --------------- | ------------------------ |
+| attention                       | full MHA        | dense compressed | indexer + top-k=16       |
+| init loss                       | 4.18 (= ln 65)  | 4.18            | 4.25                     |
+| **best val loss dense (step)**  | **1.585 (1000)** | **1.977 (1500)** | **1.923 (1250)**         |
+| best val loss top-k (step)      | —               | —               | 2.718 (1000)             |
+| final val loss dense @ 3000     | 3.116           | 2.101           | 2.090                    |
+| final val loss top-k @ 3000     | —               | —               | 3.375                    |
+| final train loss @ 3000         | 0.151           | 1.378           | 1.279                    |
+| train/val gap dense @ 3000      | 2.965           | 0.723           | 0.811                    |
+| params (excl embeddings)        | ~10.7M          | ~10.5M          | ~10.7M                   |
+| throughput                      | 217K tok/s      | 192K tok/s\*    | 159K tok/s\*             |
+| wall time                       | 528 s           | 589 s           | 810 s                    |
 
-![baseline vs csa-stage2](results/baseline_vs_csa-stage2.png)
+![3-way comparison](results/baseline_vs_csa-stage2_vs_csa-stage3.png)
 
 \* Throughput is *worse* than baseline despite CSA having ~4× fewer attention
-FLOPs because Stage 2 uses an explicit `masked_fill + softmax + nan_to_num`
-path rather than `F.scaled_dot_product_attention` (which the baseline gets to
-use). Vectorizing the safe-softmax against SDPA is a Stage 4 cleanup item;
-in v1 we prioritize clarity over perf (per project plan).
+FLOPs because Stages 2-3 use an explicit `masked_fill + softmax + nan_to_num`
+path rather than `F.scaled_dot_product_attention`. Vectorizing the safe-softmax
+against SDPA is a Stage 4 cleanup item; in v1 we prioritize clarity over perf.
 
 ### Reading the curves
 
-- Baseline overfits hard: train loss → 0.15 (memorization), val loss bottoms
-  at step 1000 and *climbs* to 3.12 by step 3000.
-- CSA's compression is a strong regularizer: train loss only drops to 1.38,
-  val loss bottoms higher (1.98) but *stays nearly flat* (2.10 at step 3000).
-- The two val curves cross around step 1750 — past that point CSA's val loss
-  is *better* than baseline's, purely because baseline is overfitting.
-- Best-case CSA val loss is ~0.4 nats worse than best-case baseline. That's
-  the cost of 4× compression on a fine-grained char-level task. A generation
-  sample shows CSA produces Shakespeare-like structure (newlines, character-
-  name colons, dialogue rhythm) but words are rougher than baseline's,
-  consistent with the loss gap.
+- **Baseline** overfits hard: train → 0.15 (memorization), val bottoms at
+  step 1000 and *climbs* to 3.12 by step 3000.
+- **Stage 2 CSA** (dense): compression acts as a strong regularizer.
+  Train bottoms at 1.38, val nearly flat at ~2.10. Best val 0.4 nats worse
+  than baseline — that's the cost of 4× compression on char-level.
+- **Stage 3 CSA dense eval** (indexer-as-additive-logits): the indexer
+  contributes meaningful gradient and dense val loss improves slightly
+  over Stage 2 (1.92 vs 1.98). The Stage 2 vs Stage 3 dense curves are
+  very close — the indexer doesn't dramatically help when full attention
+  is available.
+- **Stage 3 CSA top-k eval** at `k=16/256` blocks (pink dashed): much worse
+  (2.72 → 3.38). The dense vs top-k gap *grows* with training: as the model
+  sharpens its dense attention pattern, the indexer's additive-bias signal
+  isn't a good top-k selector. **This is exactly the train/eval mismatch
+  flagged in D3** of `notes.md` and is the price of skipping the auxiliary
+  KL loss the paper uses to align indexer with attention.
+
+### The dense / top-k gap is real
+
+In v1 the indexer is trained as an additive logit on the core attention
+score; top-k is applied only at eval. Without the paper's auxiliary KL loss,
+nothing pushes the indexer's score *distribution* to match the actual
+attention usage — so picking the indexer's top-k blocks discards blocks
+the dense attention was using. With `k=16/256` (6.25%) we lose ~0.8 nats.
+This is honest evidence for why the paper-faithful approach (aux KL teacher)
+matters and is on the future-work list.
 
 ### Eval comparability note
 
-CSA eval excludes the first `m=4` positions per sequence from the loss (D2 in
-`notes.md` — those positions have no causally-valid compressed block).
-Baseline includes all 1024 positions in eval. The 4-of-1024 = 0.4% gap is
-documented but not corrected: it's well below the 0.4-nat differences we
-care about, and re-evaluating baseline with the same mask wouldn't change
-the qualitative conclusions.
+CSA eval excludes the first `m=4` positions per sequence from the loss (D2
+— those positions have no causally-valid compressed block). Baseline
+includes all 1024 positions in eval. The 4-of-1024 = 0.4% gap is documented
+but not corrected: it's well below the differences we care about.
 
 ## Setup
 

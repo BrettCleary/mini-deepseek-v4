@@ -37,7 +37,11 @@ class TrainConfig:
     n_heads: int = 6
     block_size: int = 1024
     csa_m: int = 4
-    csa_c: int = 0  # 0 -> default to head_dim (passed as None to ModelConfig)
+    csa_c: int = 0          # 0 -> head_dim
+    csa_c_i: int = 0        # 0 -> csa_c // 2
+    csa_n_h_i: int = 0      # 0 -> max(2, n_heads // 2)
+    csa_d_c: int = 0        # 0 -> d_model // 2
+    csa_top_k: int = 16     # eval-time top-k blocks per query
 
     # optim
     batch_size: int = 32
@@ -97,6 +101,13 @@ def make_loss_mask(
     return mask
 
 
+def _set_csa_topk(m: torch.nn.Module, enabled: bool) -> None:
+    """Toggle the eval-time top-k filter on every CSAAttention block."""
+    for module in m.modules():
+        if isinstance(module, model.CSAAttention):
+            module.eval_apply_topk = enabled
+
+
 @torch.no_grad()
 def evaluate(
     m: model.MiniTransformer,
@@ -111,15 +122,36 @@ def evaluate(
     # "excluding first m" is documented in the README as negligible.
     mask_first = cfg.csa_m if cfg.attention == "csa" else 0
     loss_mask = make_loss_mask(cfg.batch_size, cfg.block_size, mask_first, device)
+
+    # For CSA, run two eval passes per D3: dense (no top-k) and top-k.
+    # Dense matches the training regime; top-k matches the deployment regime.
+    # Use the same batches for both so the comparison is paired.
+    is_csa = cfg.attention == "csa"
     out: dict[str, float] = {}
     for split_name, split_data in (("train", ds.train), ("val", ds.val)):
-        losses = torch.zeros(cfg.eval_iters)
+        dense_losses = torch.zeros(cfg.eval_iters)
+        topk_losses = torch.zeros(cfg.eval_iters) if is_csa else None
         for i in range(cfg.eval_iters):
             x, y = data.get_batch(split_data, cfg.block_size, cfg.batch_size, device)
-            _, loss = m(x, y, loss_mask=loss_mask)
-            losses[i] = loss.item()
-        out[f"{split_name}_loss"] = losses.mean().item()
-        out[f"{split_name}_ppl"] = math.exp(losses.mean().item())
+            if is_csa:
+                _set_csa_topk(m, False)
+                _, loss = m(x, y, loss_mask=loss_mask)
+                dense_losses[i] = loss.item()
+                _set_csa_topk(m, True)
+                _, loss = m(x, y, loss_mask=loss_mask)
+                topk_losses[i] = loss.item()
+            else:
+                _, loss = m(x, y, loss_mask=loss_mask)
+                dense_losses[i] = loss.item()
+        # Primary metric: dense (matches training regime). Top-k surfaces
+        # the train/eval gap when CSA is deployed sparsely.
+        out[f"{split_name}_loss"] = dense_losses.mean().item()
+        out[f"{split_name}_ppl"] = math.exp(dense_losses.mean().item())
+        if is_csa:
+            out[f"{split_name}_loss_topk"] = topk_losses.mean().item()
+            out[f"{split_name}_ppl_topk"] = math.exp(topk_losses.mean().item())
+    if is_csa:
+        _set_csa_topk(m, True)  # restore default
     m.train()
     return out
 
@@ -163,6 +195,10 @@ def train(cfg: TrainConfig) -> None:
         attention=cfg.attention,
         csa_m=cfg.csa_m,
         csa_c=cfg.csa_c if cfg.csa_c > 0 else None,
+        csa_c_i=cfg.csa_c_i if cfg.csa_c_i > 0 else None,
+        csa_n_h_i=cfg.csa_n_h_i if cfg.csa_n_h_i > 0 else None,
+        csa_d_c=cfg.csa_d_c if cfg.csa_d_c > 0 else None,
+        csa_top_k=cfg.csa_top_k,
     )
     m = model.MiniTransformer(mcfg).to(device)
     if cfg.compile:
@@ -201,11 +237,14 @@ def train(cfg: TrainConfig) -> None:
             entry = {"step": step, "kind": "eval", "elapsed_s": elapsed, **metrics}
             log_f.write(json.dumps(entry) + "\n")
             log_f.flush()
-            print(
+            line = (
                 f"[eval]  step {step:5d}  "
                 f"train {metrics['train_loss']:.4f} (ppl {metrics['train_ppl']:.2f})  "
                 f"val {metrics['val_loss']:.4f} (ppl {metrics['val_ppl']:.2f})"
             )
+            if "val_loss_topk" in metrics:
+                line += f"  val(topk) {metrics['val_loss_topk']:.4f} (ppl {metrics['val_ppl_topk']:.2f})"
+            print(line)
 
         if step == cfg.max_iters:
             break

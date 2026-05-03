@@ -40,8 +40,12 @@ class ModelConfig:
     d_ff: int | None = None     # SwiGLU inner dim. Defaults to ~8/3 * d_model.
 
     # CSA-specific (used only when attention == "csa")
-    csa_m: int = 4              # compression factor: m KV tokens -> 1 compressed entry
-    csa_c: int | None = None    # compressed/per-head dim. Defaults to head_dim.
+    csa_m: int = 4                # compression factor: m KV tokens -> 1 compressed entry
+    csa_c: int | None = None      # compressed/per-head dim. Defaults to head_dim.
+    csa_c_i: int | None = None    # indexer head dim. Defaults to csa_c // 2.
+    csa_n_h_i: int | None = None  # indexer query heads. Defaults to max(2, n_heads // 2).
+    csa_d_c: int | None = None    # shared query latent dim. Defaults to d_model // 2.
+    csa_top_k: int = 16           # eval-time top-k blocks per query (D3).
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
@@ -50,6 +54,12 @@ class ModelConfig:
             self.d_ff = _round_to(int(8 * self.d_model / 3), 64)
         if self.csa_c is None:
             self.csa_c = self.head_dim
+        if self.csa_c_i is None:
+            self.csa_c_i = max(8, self.csa_c // 2)
+        if self.csa_n_h_i is None:
+            self.csa_n_h_i = max(2, self.n_heads // 2)
+        if self.csa_d_c is None:
+            self.csa_d_c = self.d_model // 2
         assert self.block_size % self.csa_m == 0, "block_size must be divisible by csa_m"
 
     @property
@@ -186,18 +196,66 @@ class CSACompression(nn.Module):
         return C_comp  # (b, n_blk, c)
 
 
-class CSAAttention(nn.Module):
-    """Stage-2 CSA: compression + dense attention over all C^Comp blocks.
+class CSAIndexer(nn.Module):
+    """Paper eqs. 13-17: lightning indexer producing per-(query, block) scores.
 
-    No lightning indexer (Stage 3 adds it) and no latent-query factorization
-    (Stage 4 reuses the indexer's latent c^Q). For Stage 2 we project H
-    directly to per-head queries.
+      eq. 13:  c^Q_t = h_t · W^DQ                  shape (b, n, d_c)
+      eq. 14:  q^I_t = c^Q_t · W^IUQ -> heads      shape (b, n, n_h^I, c^I)
+      eq. 15:  w^I_t = h_t · W^w                   shape (b, n, n_h^I)
+      K^IComp: separate compressor (D1)            shape (b, n_blk, c^I)
+      eq. 16:  I[t, s] = sum_h w^I[t, h] * ReLU(q^I[t, h] · K^IComp[s])
+
+    The shared latent `c^Q` is exposed (returned alongside the scores) so
+    Stage 4's core-query path can reuse it via W^UQ.
+
+    Note on training signal (D3): Stage 3 wires the scores `I` as additive
+    logits to core attention so the indexer receives gradient. Top-k
+    selection is applied only at eval to match the deployment regime.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.m = cfg.csa_m
+        self.c_i = cfg.csa_c_i
+        self.n_h_i = cfg.csa_n_h_i
+        self.d_c = cfg.csa_d_c
+        # eq. 13, 14: the shared latent and its indexer up-projection
+        self.W_DQ = nn.Linear(cfg.d_model, cfg.csa_d_c, bias=False)
+        self.W_IUQ = nn.Linear(cfg.csa_d_c, cfg.csa_c_i * cfg.csa_n_h_i, bias=False)
+        # eq. 15: per-head scoring weights
+        self.W_w = nn.Linear(cfg.d_model, cfg.csa_n_h_i, bias=False)
+        # K^IComp: separate compressor with its own projections (D1).
+        self.compress_indexer = CSACompression(cfg.d_model, cfg.csa_c_i, cfg.csa_m)
+
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        c_q = self.W_DQ(h)                                                  # (b, n, d_c)
+        q_i = rearrange(self.W_IUQ(c_q), "b n (h c) -> b n h c", h=self.n_h_i)
+        w_i = self.W_w(h)                                                   # (b, n, n_h_i)
+        K_iComp = self.compress_indexer(h)                                  # (b, n_blk, c_i)
+        # eq. 16: per-head ReLU dot product, then per-head weighted sum.
+        # einsum: (b, n, h, c_i) x (b, n_blk, c_i) -> (b, n, h, n_blk)
+        dots = einsum(q_i, K_iComp, "b n h c, b s c -> b n h s")
+        scores = (w_i.unsqueeze(-1) * F.relu(dots)).sum(dim=2)              # (b, n, n_blk)
+        return scores, c_q
+
+
+class CSAAttention(nn.Module):
+    """Stage-3 CSA: compression + lightning indexer + dense (train) /
+    top-k (eval) attention over C^Comp blocks.
+
+    The indexer scores `I[t, s]` are added as a per-block additive bias to
+    the core attention logits during BOTH train and eval — this is how the
+    indexer receives gradient (D3). At eval, an additional top-k mask
+    restricts attention to the `csa_top_k` highest-scoring blocks per query
+    position.
+
+    Stage 4 will replace the direct `W_Q` with a `W^UQ` up-projection of the
+    shared latent `c^Q` returned by the indexer.
 
     Causal mask: query at token t may only attend to compressed blocks
     s < floor(t/m). Positions t < m have no causally-valid block — their
-    output is forced to zero by the safe softmax (rows with all -inf give
-    weight 0 everywhere). The training loop masks those positions out of
-    the loss (per design decision D2).
+    output is forced to zero by the safe softmax. The training loop masks
+    those positions from the loss (per D2).
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
@@ -205,9 +263,15 @@ class CSAAttention(nn.Module):
         self.n_heads = cfg.n_heads
         self.c = cfg.csa_c
         self.m = cfg.csa_m
+        self.top_k = cfg.csa_top_k
+        # Toggle for the eval-time top-k filter. Set to False to evaluate
+        # densely (no top-k), used by the training loop's dual eval to
+        # report the train/eval mismatch metric (D3).
+        self.eval_apply_topk = True
         self.compress = CSACompression(cfg.d_model, cfg.csa_c, cfg.csa_m)
-        # Stage 2 query projection: H -> n_h heads of c. Stage 3+ replaces
-        # this with the W^DQ -> W^UQ low-rank pair shared with the indexer.
+        self.indexer = CSAIndexer(cfg)
+        # Stage 3 query projection: still H -> n_h heads of c (direct).
+        # Stage 4 will replace this with c^Q · W^UQ.
         self.W_Q = nn.Linear(cfg.d_model, cfg.n_heads * cfg.csa_c, bias=False)
         # paper §2.3.3: per-head RMSNorm before core attention
         self.q_norm = RMSNorm(cfg.csa_c)
@@ -228,20 +292,34 @@ class CSAAttention(nn.Module):
         kv = self.compress(x)        # (b, n_blk, c)
         kv = self.k_norm(kv)
 
-        # Scores: each query head h dots its (b, n, c) against the shared
-        # (b, n_blk, c). Result (b, h, n, n_blk).
-        scores = einsum(q, kv, "b n h c, b s c -> b h n s") / math.sqrt(c)
+        # Indexer scores I[t, s] (b, n, n_blk); c_q is exposed for Stage 4.
+        indexer_scores, _c_q = self.indexer(x)
+
+        # Core attention logits + indexer-as-additive-bias. The indexer
+        # contributes equally to every query head (broadcast over h).
+        core_scores = einsum(q, kv, "b n h c, b s c -> b h n s") / math.sqrt(c)
+        scores = core_scores + indexer_scores.unsqueeze(1)                  # (b, h, n, n_blk)
 
         # Causal mask: token index t may attend to blocks s < t // m.
         device = x.device
-        token_idx = torch.arange(n, device=device).unsqueeze(1)        # (n, 1)
-        block_idx = torch.arange(n_blk, device=device).unsqueeze(0)    # (1, n_blk)
-        mask = block_idx < (token_idx // m)                            # (n, n_blk)
-        scores = scores.masked_fill(~mask, float("-inf"))
+        token_idx = torch.arange(n, device=device).unsqueeze(1)             # (n, 1)
+        block_idx = torch.arange(n_blk, device=device).unsqueeze(0)         # (1, n_blk)
+        causal = block_idx < (token_idx // m)                               # (n, n_blk)
+        scores = scores.masked_fill(~causal, float("-inf"))
 
-        # Safe softmax: for positions where every block is masked (rows where
-        # t // m == 0, i.e. t < m), softmax gives NaN. nan_to_num maps those
-        # to 0 so the output is exactly zero for those positions.
+        # Top-k selection at eval (D3). The indexer's CAUSALLY-MASKED scores
+        # decide which blocks survive; the same set is applied to all query
+        # heads (matches MQA: all heads share K=V).
+        if (not self.training) and self.eval_apply_topk and self.top_k < n_blk:
+            masked_idx = indexer_scores.masked_fill(~causal, float("-inf"))
+            _, topk_idx = masked_idx.topk(k=self.top_k, dim=-1)             # (b, n, k)
+            keep = torch.zeros_like(masked_idx, dtype=torch.bool)
+            keep.scatter_(-1, topk_idx, True)                                # (b, n, n_blk)
+            scores = scores.masked_fill(~keep.unsqueeze(1), float("-inf"))
+
+        # Safe softmax: rows that are fully -inf (positions t < m, or top-k
+        # rows where every kept block is causally invalid) yield NaN; replace
+        # with zero so the output is deterministic zero for those positions.
         attn = F.softmax(scores, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0)
 

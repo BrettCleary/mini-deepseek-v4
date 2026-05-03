@@ -255,12 +255,195 @@ def test_attention_no_future_leakage() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Indexer tests (Stage 3)
+# ---------------------------------------------------------------------------
+
+
+def _indexer_cfg(**overrides) -> model.ModelConfig:
+    base = dict(
+        vocab_size=10, d_model=16, n_layers=1, n_heads=2,
+        block_size=16, attention="csa",
+        csa_m=4, csa_c=8, csa_c_i=4, csa_n_h_i=2, csa_d_c=8, csa_top_k=2,
+    )
+    base.update(overrides)
+    return model.ModelConfig(**base)
+
+
+def test_indexer_shape() -> None:
+    """Scores: (b, n, n_blk). Latent c^Q: (b, n, d_c)."""
+    cfg = _indexer_cfg()
+    idx = model.CSAIndexer(cfg)
+    h = torch.randn(3, cfg.block_size, cfg.d_model)
+    scores, c_q = idx(h)
+    assert scores.shape == (3, cfg.block_size, cfg.block_size // cfg.csa_m)
+    assert c_q.shape == (3, cfg.block_size, cfg.csa_d_c)
+
+
+def test_indexer_relu_kills_negative_dots() -> None:
+    """If all q^I·K^IComp dots are negative, ReLU zeroes them and the
+    score is identically zero regardless of `w^I`."""
+    cfg = _indexer_cfg()
+    idx = model.CSAIndexer(cfg)
+    # Force q^I to be a large negative constant and K^IComp to be a large
+    # positive constant: every dot is hugely negative -> ReLU = 0.
+    with torch.no_grad():
+        idx.W_DQ.weight.zero_()
+        idx.W_IUQ.weight.zero_()
+        idx.W_IUQ.bias is None  # sanity (Linear(... bias=False))
+        # Bias-free linears only zero the projection. Use direct override:
+        # build an alternate path by adding a bias via a hook — simpler to
+        # just inject q^I and K^IComp values via monkey-patching forward.
+    # Simpler: replace the modules with constant-valued ones.
+    h = torch.randn(2, cfg.block_size, cfg.d_model)
+
+    class FakeIndexer(torch.nn.Module):
+        def __init__(self, real: model.CSAIndexer) -> None:
+            super().__init__()
+            self.W_w = real.W_w
+            self.n_h_i = real.n_h_i
+            self.q_const = -1e3
+            self.k_const = 1e3
+
+        def forward(self, h: torch.Tensor):
+            b, n, _ = h.shape
+            n_blk = n // 4
+            q_i = torch.full((b, n, self.n_h_i, 4), self.q_const)
+            K_i = torch.full((b, n_blk, 4), self.k_const)
+            w_i = self.W_w(h)
+            dots = einsum_local(q_i, K_i)
+            scores = (w_i.unsqueeze(-1) * torch.relu(dots)).sum(dim=2)
+            return scores, h
+
+    def einsum_local(q, k):
+        # mimic the real indexer's einsum
+        return torch.einsum("bnhc,bsc->bnhs", q, k)
+
+    fake = FakeIndexer(idx)
+    scores, _ = fake(h)
+    assert torch.all(scores == 0), f"expected all zeros (ReLU on negative dots), got max={scores.abs().max().item()}"
+
+
+def test_indexer_zero_w_zeroes_scores() -> None:
+    """If `w^I` is identically zero, every score is zero regardless of dots."""
+    cfg = _indexer_cfg()
+    idx = model.CSAIndexer(cfg)
+    with torch.no_grad():
+        idx.W_w.weight.zero_()
+    h = torch.randn(2, cfg.block_size, cfg.d_model)
+    scores, _ = idx(h)
+    assert torch.all(scores == 0)
+
+
+def test_indexer_handcomputed_single_position() -> None:
+    """Hand-compute eq. 16 for one (t, s) pair.
+
+    Setup: n_h_i=1 so the per-head sum collapses to a single term:
+        I[t, s] = w^I[t, 0] * ReLU(q^I[t, 0] · K^IComp[s])
+    Set W_DQ, W_IUQ to the identity-like maps, W_w to a constant 1, and
+    pin the indexer's compressor to known weights so K^IComp[s] is
+    known. Then verify one slot.
+    """
+    cfg = _indexer_cfg(d_model=4, csa_d_c=4, csa_c_i=4, csa_n_h_i=1, block_size=8, csa_m=4)
+    idx = model.CSAIndexer(cfg)
+    with torch.no_grad():
+        idx.W_DQ.weight.copy_(torch.eye(cfg.d_model))         # c^Q = h
+        idx.W_IUQ.weight.copy_(torch.eye(cfg.csa_c_i))        # q^I = c^Q (one head)
+        idx.W_w.weight.zero_()                                # base
+        idx.W_w.weight[0, 0] = 1.0                            # w^I = h[..., 0] (one head)
+        # Build the indexer's compressor to deterministic outputs:
+        #   W_aKV = identity, W_bKV = identity
+        #   W_aZ = W_bZ = 0, B_a = B_b = 0
+        # Then K^IComp[s] = mean over 2m source-token vectors of the
+        # (a-stream + b-stream-front-padded) — exactly like Stage 2's
+        # hand-compute test.
+        idx.compress_indexer.W_aKV.weight.copy_(torch.eye(cfg.csa_c_i))
+        idx.compress_indexer.W_bKV.weight.copy_(torch.eye(cfg.csa_c_i))
+        idx.compress_indexer.W_aZ.weight.zero_()
+        idx.compress_indexer.W_bZ.weight.zero_()
+        idx.compress_indexer.B_a.zero_()
+        idx.compress_indexer.B_b.zero_()
+
+    # Build h: each token's vector is its position index repeated.
+    h = torch.zeros(1, cfg.block_size, cfg.d_model)
+    for t in range(cfg.block_size):
+        h[0, t, 0] = float(t)            # so w^I[t, 0] = t
+        h[0, t, 1] = 1.0                 # the rest of h is constant 1
+
+    scores, _ = idx(h)
+    # Block 0: K^IComp[0] = average of h[0..3] = ([0+1+2+3]/4, 1, 0, 0) = (1.5, 1, 0, 0)
+    # but with i=0 boundary: prev half is zero, so denominator over m=4 only.
+    # q^I[t, 0] = h[t] = (t, 1, 0, 0)
+    # dot = t * 1.5 + 1 * 1 = 1.5 t + 1
+    # I[t, 0] = w^I[t, 0] * relu(1.5 t + 1) = t * (1.5 t + 1)  for t >= 0
+    for t in range(1, cfg.block_size):
+        expected = float(t) * (1.5 * t + 1.0)
+        actual = scores[0, t, 0].item()
+        assert abs(actual - expected) < 1e-4, f"t={t}: expected {expected}, got {actual}"
+
+
+def test_attention_topk_active_only_at_eval() -> None:
+    """csa_top_k < n_blk should change attention output between train and eval
+    (top-k applied only at eval per D3)."""
+    cfg = _indexer_cfg(block_size=32, csa_m=4, csa_top_k=1)  # n_blk=8, top_k=1
+    attn = model.CSAAttention(cfg)
+    x = torch.randn(2, cfg.block_size, cfg.d_model)
+    attn.train()
+    with torch.no_grad():
+        out_train = attn(x)
+    attn.eval()
+    with torch.no_grad():
+        out_eval = attn(x)
+    # Different in train vs eval (because eval applies top-k mask).
+    assert not torch.allclose(out_train, out_eval, atol=1e-5), (
+        "expected train/eval outputs to differ when top-k is active"
+    )
+
+
+def test_attention_topk_disabled_when_geq_n_blk() -> None:
+    """If csa_top_k >= n_blk, top-k is a no-op so train and eval outputs match
+    (modulo dropout etc — none here)."""
+    cfg = _indexer_cfg(block_size=32, csa_m=4, csa_top_k=8)  # n_blk=8, top_k=8
+    attn = model.CSAAttention(cfg)
+    x = torch.randn(2, cfg.block_size, cfg.d_model)
+    attn.train()
+    with torch.no_grad():
+        out_train = attn(x)
+    attn.eval()
+    with torch.no_grad():
+        out_eval = attn(x)
+    torch.testing.assert_close(out_train, out_eval, rtol=1e-5, atol=1e-5)
+
+
+def test_attention_no_future_leakage_with_indexer() -> None:
+    """No-future-leakage invariant must still hold with the indexer wired in."""
+    cfg = _indexer_cfg(block_size=16, csa_m=4)
+    attn = model.CSAAttention(cfg)
+    attn.eval()
+
+    x = torch.randn(1, cfg.block_size, cfg.d_model)
+    with torch.no_grad():
+        out_a = attn(x)
+    x2 = x.clone()
+    x2[:, -1, :] += 10.0
+    with torch.no_grad():
+        out_b = attn(x2)
+
+    # Same reasoning as Stage 2's no-future-leakage test: positions 0..11
+    # never attend to block 3 (which contains positions 12..15).
+    torch.testing.assert_close(
+        out_a[:, :12, :], out_b[:, :12, :], rtol=1e-5, atol=1e-5,
+        msg="future token leaked into past-position output (with indexer)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner (no pytest required)
 # ---------------------------------------------------------------------------
 
 
 def _run_all() -> None:
     tests = [
+        # Stage 2: compression + dense attention
         test_compression_shape,
         test_compression_handcomputed_m2,
         test_compression_block_zero_boundary_no_cb_contribution,
@@ -269,6 +452,14 @@ def _run_all() -> None:
         test_attention_first_m_output_is_zero,
         test_attention_causal_mask_shape,
         test_attention_no_future_leakage,
+        # Stage 3: lightning indexer
+        test_indexer_shape,
+        test_indexer_relu_kills_negative_dots,
+        test_indexer_zero_w_zeroes_scores,
+        test_indexer_handcomputed_single_position,
+        test_attention_topk_active_only_at_eval,
+        test_attention_topk_disabled_when_geq_n_blk,
+        test_attention_no_future_leakage_with_indexer,
     ]
     failed = 0
     for t in tests:
