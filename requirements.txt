@@ -1,0 +1,5 @@
+torch>=2.7
+numpy
+einops
+matplotlib
+requests

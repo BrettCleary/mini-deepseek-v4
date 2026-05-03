@@ -6,11 +6,10 @@ __pycache__/
 venv/
 .env
 
-# checkpoints, logs, datasets
+# model checkpoints (large) — but keep run logs + configs tracked
 *.pt
 *.ckpt
 *.safetensors
-runs/
 logs/
 data/
 checkpoints/
