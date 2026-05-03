@@ -36,6 +36,8 @@ class TrainConfig:
     n_layers: int = 6
     n_heads: int = 6
     block_size: int = 1024
+    csa_m: int = 4
+    csa_c: int = 0  # 0 -> default to head_dim (passed as None to ModelConfig)
 
     # optim
     batch_size: int = 32
@@ -81,6 +83,20 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.lr - cfg.min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
+def make_loss_mask(
+    batch_size: int, block_size: int, mask_first: int, device: torch.device
+) -> torch.Tensor | None:
+    """Per-design-decision D2: zero out the first `mask_first` positions of
+    every sequence so they don't contribute to the loss. CSA produces zero
+    attention output for those positions (no causally-valid block exists),
+    so they have no learning signal and shouldn't move the gradient."""
+    if mask_first <= 0:
+        return None
+    mask = torch.ones((batch_size, block_size), device=device)
+    mask[:, :mask_first] = 0.0
+    return mask
+
+
 @torch.no_grad()
 def evaluate(
     m: model.MiniTransformer,
@@ -89,12 +105,18 @@ def evaluate(
     device: torch.device,
 ) -> dict[str, float]:
     m.eval()
+    # Mask first csa_m positions for csa eval (those positions have no
+    # learning signal — see D2). For vanilla, no mask: every position is
+    # valid. The 0.4% gap (4/1024) between vanilla "all positions" and csa
+    # "excluding first m" is documented in the README as negligible.
+    mask_first = cfg.csa_m if cfg.attention == "csa" else 0
+    loss_mask = make_loss_mask(cfg.batch_size, cfg.block_size, mask_first, device)
     out: dict[str, float] = {}
     for split_name, split_data in (("train", ds.train), ("val", ds.val)):
         losses = torch.zeros(cfg.eval_iters)
         for i in range(cfg.eval_iters):
             x, y = data.get_batch(split_data, cfg.block_size, cfg.batch_size, device)
-            _, loss = m(x, y)
+            _, loss = m(x, y, loss_mask=loss_mask)
             losses[i] = loss.item()
         out[f"{split_name}_loss"] = losses.mean().item()
         out[f"{split_name}_ppl"] = math.exp(losses.mean().item())
@@ -139,6 +161,8 @@ def train(cfg: TrainConfig) -> None:
         n_heads=cfg.n_heads,
         block_size=cfg.block_size,
         attention=cfg.attention,
+        csa_m=cfg.csa_m,
+        csa_c=cfg.csa_c if cfg.csa_c > 0 else None,
     )
     m = model.MiniTransformer(mcfg).to(device)
     if cfg.compile:
@@ -159,6 +183,9 @@ def train(cfg: TrainConfig) -> None:
     log_path = run_dir / "log.jsonl"
     log_f = log_path.open("w")
     print(f"[run]   logging to {run_dir}")
+
+    train_mask_first = cfg.csa_m if cfg.attention == "csa" else 0
+    train_loss_mask = make_loss_mask(cfg.batch_size, cfg.block_size, train_mask_first, device)
 
     m.train()
     t0 = time.time()
@@ -189,7 +216,7 @@ def train(cfg: TrainConfig) -> None:
             g["lr"] = lr
 
         x, y = data.get_batch(ds.train, cfg.block_size, cfg.batch_size, device)
-        _, loss = m(x, y)
+        _, loss = m(x, y, loss_mask=train_loss_mask)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
