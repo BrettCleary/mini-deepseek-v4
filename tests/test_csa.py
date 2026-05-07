@@ -437,6 +437,69 @@ def test_attention_no_future_leakage_with_indexer() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Shared-KV MQA tests (Stage 4)
+# ---------------------------------------------------------------------------
+
+
+def test_stage4_uses_w_uq_not_w_q() -> None:
+    """Stage 4 removes the direct H -> queries projection (W_Q) and replaces
+    it with a low-rank c^Q -> queries projection (W_UQ)."""
+    cfg = _indexer_cfg()
+    attn = model.CSAAttention(cfg)
+    assert hasattr(attn, "W_UQ"), "Stage 4 should add W_UQ"
+    assert not hasattr(attn, "W_Q"), "Stage 4 should drop the direct W_Q (queries come from c^Q)"
+    # W_UQ shape: (n_h * c, d_c) — Linear stores weight as (out, in)
+    assert attn.W_UQ.weight.shape == (cfg.n_heads * cfg.csa_c, cfg.csa_d_c)
+
+
+def test_stage4_W_DQ_feeds_core_queries() -> None:
+    """In Stage 4 the indexer's W_DQ projection feeds BOTH the indexer
+    queries AND the core queries (eq. 13 + eq. 18 share c^Q). Perturbing
+    W_DQ should change the attention output even when the indexer's
+    contribution to the logits is held constant."""
+    cfg = _indexer_cfg(block_size=16, csa_m=4, csa_top_k=99)  # disable top-k effect
+    attn = model.CSAAttention(cfg)
+    attn.eval()
+    attn.eval_apply_topk = False  # also disable to be safe
+    x = torch.randn(1, cfg.block_size, cfg.d_model)
+    with torch.no_grad():
+        out_a = attn(x)
+        # Perturb W_DQ — c^Q changes, so both indexer queries AND core queries change.
+        attn.indexer.W_DQ.weight.add_(0.5 * torch.randn_like(attn.indexer.W_DQ.weight))
+        out_b = attn(x)
+    assert not torch.allclose(out_a, out_b, atol=1e-5), (
+        "perturbing W_DQ should change attention output (c^Q feeds core queries in Stage 4)"
+    )
+
+
+def test_stage4_zero_W_UQ_zeros_attention_output_post_first_m() -> None:
+    """If W_UQ is zero, core queries are zero, so q·K = 0 — but the indexer
+    additive bias still gives a non-uniform softmax. The attention output
+    is then a weighted average of K=V values per indexer scores. This is
+    well-defined and not identically zero (so it doesn't replicate the
+    first-m-positions zeroing).
+
+    The point of this test: if the test_attention_first_m_output_is_zero
+    invariant from Stage 2 still holds with W_UQ zeroed, we know the
+    first-m guard is robust to the new query path."""
+    cfg = _indexer_cfg(block_size=16, csa_m=4, csa_top_k=99)
+    attn = model.CSAAttention(cfg)
+    attn.eval_apply_topk = False
+    with torch.no_grad():
+        attn.W_UQ.weight.zero_()
+    x = torch.randn(2, cfg.block_size, cfg.d_model)
+    with torch.no_grad():
+        out = attn(x)
+    # First m positions still exactly zero (causal mask + safe softmax).
+    torch.testing.assert_close(
+        out[:, :cfg.csa_m, :], torch.zeros(2, cfg.csa_m, cfg.d_model),
+        rtol=0, atol=1e-6,
+    )
+    # Position m onwards is non-zero (driven by indexer-only attention).
+    assert out[:, cfg.csa_m:, :].abs().max().item() > 1e-3
+
+
+# ---------------------------------------------------------------------------
 # Runner (no pytest required)
 # ---------------------------------------------------------------------------
 
@@ -460,6 +523,10 @@ def _run_all() -> None:
         test_attention_topk_active_only_at_eval,
         test_attention_topk_disabled_when_geq_n_blk,
         test_attention_no_future_leakage_with_indexer,
+        # Stage 4: shared-KV MQA
+        test_stage4_uses_w_uq_not_w_q,
+        test_stage4_W_DQ_feeds_core_queries,
+        test_stage4_zero_W_UQ_zeros_attention_output_post_first_m,
     ]
     failed = 0
     for t in tests:

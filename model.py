@@ -240,17 +240,22 @@ class CSAIndexer(nn.Module):
 
 
 class CSAAttention(nn.Module):
-    """Stage-3 CSA: compression + lightning indexer + dense (train) /
-    top-k (eval) attention over C^Comp blocks.
+    """Stage-4 CSA: full Shared-KV MQA over indexer-selected compressed blocks.
 
-    The indexer scores `I[t, s]` are added as a per-block additive bias to
-    the core attention logits during BOTH train and eval — this is how the
-    indexer receives gradient (D3). At eval, an additional top-k mask
-    restricts attention to the `csa_top_k` highest-scoring blocks per query
-    position.
+    Now matches the paper's eqs. 18-19 verbatim:
+        eq. 18  [q_{t,1};...;q_{t,n_h}] = c^Q_t · W^UQ
+        eq. 19  o_{t,i} = CoreAttn(q_{t,i}, K=C^SprsComp_t, V=C^SprsComp_t)
 
-    Stage 4 will replace the direct `W_Q` with a `W^UQ` up-projection of the
-    shared latent `c^Q` returned by the indexer.
+    The shared latent c^Q (eq. 13) is computed once inside the indexer and
+    feeds BOTH the indexer queries (via W^IUQ) and the core queries (via
+    W^UQ here). This collapses the two query paths into a single low-rank
+    bottleneck, exactly as the paper specifies, and trims params (the old
+    W_Q was d × n_h·c; W^UQ is only d_c × n_h·c, with d_c = d/2).
+
+    Indexer scores `I[t, s]` are added as a per-block additive bias to the
+    core attention logits during BOTH train and eval, so the indexer
+    receives gradient. At eval, a top-k mask additionally restricts
+    attention to the `csa_top_k` highest-scoring blocks per query (D3).
 
     Causal mask: query at token t may only attend to compressed blocks
     s < floor(t/m). Positions t < m have no causally-valid block — their
@@ -264,36 +269,34 @@ class CSAAttention(nn.Module):
         self.c = cfg.csa_c
         self.m = cfg.csa_m
         self.top_k = cfg.csa_top_k
-        # Toggle for the eval-time top-k filter. Set to False to evaluate
+        # Toggle for the eval-time top-k filter. Set False to evaluate
         # densely (no top-k), used by the training loop's dual eval to
         # report the train/eval mismatch metric (D3).
         self.eval_apply_topk = True
         self.compress = CSACompression(cfg.d_model, cfg.csa_c, cfg.csa_m)
         self.indexer = CSAIndexer(cfg)
-        # Stage 3 query projection: still H -> n_h heads of c (direct).
-        # Stage 4 will replace this with c^Q · W^UQ.
-        self.W_Q = nn.Linear(cfg.d_model, cfg.n_heads * cfg.csa_c, bias=False)
+        # eq. 18: up-project the shared latent c^Q into n_h core query heads.
+        self.W_UQ = nn.Linear(cfg.csa_d_c, cfg.n_heads * cfg.csa_c, bias=False)
         # paper §2.3.3: per-head RMSNorm before core attention
         self.q_norm = RMSNorm(cfg.csa_c)
         self.k_norm = RMSNorm(cfg.csa_c)
         self.W_O = nn.Linear(cfg.n_heads * cfg.csa_c, cfg.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, n, _ = x.shape
+        n = x.shape[1]
         m, c = self.m, self.c
         n_blk = n // m
 
-        # Queries — per-head, RMSNorm applied over last dim (c) so each head
-        # is normalized independently.
-        q = rearrange(self.W_Q(x), "b n (h c) -> b n h c", h=self.n_heads)
+        # Indexer produces both the per-block scores and the shared latent c^Q.
+        indexer_scores, c_q = self.indexer(x)
+
+        # eq. 18: core queries from the same latent c^Q the indexer uses.
+        q = rearrange(self.W_UQ(c_q), "b n (h c) -> b n h c", h=self.n_heads)
         q = self.q_norm(q)
 
         # Compressed keys = values, shared across all query heads (MQA).
         kv = self.compress(x)        # (b, n_blk, c)
         kv = self.k_norm(kv)
-
-        # Indexer scores I[t, s] (b, n, n_blk); c_q is exposed for Stage 4.
-        indexer_scores, _c_q = self.indexer(x)
 
         # Core attention logits + indexer-as-additive-bias. The indexer
         # contributes equally to every query head (broadcast over h).

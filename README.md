@@ -17,7 +17,11 @@ Built incrementally; each stage is committed in a runnable state.
 - [x] **Stage 1** — vanilla decoder-only transformer baseline.
 - [x] **Stage 2** — CSA compression (eqs. 9–12) with dense attention over all C^Comp blocks.
 - [x] **Stage 3** — Lightning indexer (eqs. 13–17) with dense-train / top-k-eval (D3).
-- [ ] Stage 4 — Shared-KV MQA (eqs. 18–19).
+- [x] **Stage 4** — Shared-KV MQA (eqs. 18–19): core queries reuse the indexer's latent c^Q.
+
+The four-stage CSA implementation is now complete. Future-work items (auxiliary
+KL teacher loss, partial RoPE, sliding window, attention sink, grouped output
+projection, HCA) are tracked in `notes.md`.
 
 ## Results
 
@@ -29,21 +33,21 @@ tied LM head. The only thing that varies is the attention block.
 CSA shared config: `m=4`, `c=64` (= head_dim) so the KV cache is compressed
 4× along the sequence dimension (`n_blk=256` for `block_size=1024`).
 
-| metric                          | baseline-v1     | csa-stage2-v1   | csa-stage3-v1            |
-| ------------------------------- | --------------- | --------------- | ------------------------ |
-| attention                       | full MHA        | dense compressed | indexer + top-k=16       |
-| init loss                       | 4.18 (= ln 65)  | 4.18            | 4.25                     |
-| **best val loss dense (step)**  | **1.585 (1000)** | **1.977 (1500)** | **1.923 (1250)**         |
-| best val loss top-k (step)      | —               | —               | 2.718 (1000)             |
-| final val loss dense @ 3000     | 3.116           | 2.101           | 2.090                    |
-| final val loss top-k @ 3000     | —               | —               | 3.375                    |
-| final train loss @ 3000         | 0.151           | 1.378           | 1.279                    |
-| train/val gap dense @ 3000      | 2.965           | 0.723           | 0.811                    |
-| params (excl embeddings)        | ~10.7M          | ~10.5M          | ~10.7M                   |
-| throughput                      | 217K tok/s      | 192K tok/s\*    | 159K tok/s\*             |
-| wall time                       | 528 s           | 589 s           | 810 s                    |
+| metric                          | baseline-v1     | csa-stage2-v1   | csa-stage3-v1   | csa-stage4-v1   |
+| ------------------------------- | --------------- | --------------- | --------------- | --------------- |
+| attention                       | full MHA        | dense compressed | + indexer       | + shared latent |
+| init loss                       | 4.18 (= ln 65)  | 4.18            | 4.25            | 4.26            |
+| **best val loss dense (step)**  | **1.585 (1000)** | **1.977 (1500)** | **1.923 (1250)** | **1.933 (1250)** |
+| best val loss top-k (step)      | —               | —               | 2.718 (1000)    | **2.690 (1000)** |
+| final val loss dense @ 3000     | 3.116           | 2.101           | 2.090           | 2.119           |
+| final val loss top-k @ 3000     | —               | —               | 3.375           | **3.209**       |
+| final train loss @ 3000         | 0.151           | 1.378           | 1.279           | 1.286           |
+| train/val gap dense @ 3000      | 2.965           | 0.723           | 0.811           | 0.833           |
+| params (excl embeddings)        | ~10.7M          | ~10.5M          | ~10.7M          | **~9.9M**       |
+| throughput                      | 217K tok/s      | 192K tok/s\*    | 159K tok/s\*    | 156K tok/s\*    |
+| wall time                       | 528 s           | 589 s           | 810 s           | 819 s           |
 
-![3-way comparison](results/baseline_vs_csa-stage2_vs_csa-stage3.png)
+![all stages](results/all_stages.png)
 
 \* Throughput is *worse* than baseline despite CSA having ~4× fewer attention
 FLOPs because Stages 2-3 use an explicit `masked_fill + softmax + nan_to_num`
@@ -68,6 +72,14 @@ against SDPA is a Stage 4 cleanup item; in v1 we prioritize clarity over perf.
   isn't a good top-k selector. **This is exactly the train/eval mismatch
   flagged in D3** of `notes.md` and is the price of skipping the auxiliary
   KL loss the paper uses to align indexer with attention.
+- **Stage 4 CSA** (shared latent c^Q): structural cleanup matching the
+  paper's eqs. 18–19 verbatim. Dense val is statistical-noise close to
+  Stage 3, top-k val is ~0.16 nats *better* (3.21 vs 3.38 final). The
+  shared latent means `W_DQ` now gets gradient from BOTH the indexer
+  *and* the core attention, which plausibly nudges the indexer's score
+  distribution closer to actual attention usage. Param count drops from
+  ~10.7M to ~9.9M because `W_UQ : d_c × n_h·c` is half the size of the
+  Stage-3 `W_Q : d × n_h·c` it replaces.
 
 ### The dense / top-k gap is real
 
