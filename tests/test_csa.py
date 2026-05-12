@@ -192,7 +192,7 @@ def test_attention_first_m_output_is_zero() -> None:
     )
     attn = model.CSAAttention(cfg)
     x = torch.randn(2, cfg.block_size, cfg.d_model)
-    out = attn(x)
+    out, _ = attn(x)
 
     # First m positions: identically zero.
     torch.testing.assert_close(
@@ -235,13 +235,13 @@ def test_attention_no_future_leakage() -> None:
 
     x = torch.randn(1, cfg.block_size, cfg.d_model)
     with torch.no_grad():
-        out_a = attn(x)
+        out_a, _ = attn(x)
 
     # Perturb a "future" token: t' = block_size - 1.
     x2 = x.clone()
     x2[:, -1, :] += 10.0
     with torch.no_grad():
-        out_b = attn(x2)
+        out_b, _ = attn(x2)
 
     # All but the last few positions should be unchanged. Specifically, any
     # position t with floor(t/m) <= floor((n-1)/m) - 1 cannot see the last
@@ -389,10 +389,10 @@ def test_attention_topk_active_only_at_eval() -> None:
     x = torch.randn(2, cfg.block_size, cfg.d_model)
     attn.train()
     with torch.no_grad():
-        out_train = attn(x)
+        out_train, _ = attn(x)
     attn.eval()
     with torch.no_grad():
-        out_eval = attn(x)
+        out_eval, _ = attn(x)
     # Different in train vs eval (because eval applies top-k mask).
     assert not torch.allclose(out_train, out_eval, atol=1e-5), (
         "expected train/eval outputs to differ when top-k is active"
@@ -407,10 +407,10 @@ def test_attention_topk_disabled_when_geq_n_blk() -> None:
     x = torch.randn(2, cfg.block_size, cfg.d_model)
     attn.train()
     with torch.no_grad():
-        out_train = attn(x)
+        out_train, _ = attn(x)
     attn.eval()
     with torch.no_grad():
-        out_eval = attn(x)
+        out_eval, _ = attn(x)
     torch.testing.assert_close(out_train, out_eval, rtol=1e-5, atol=1e-5)
 
 
@@ -422,11 +422,11 @@ def test_attention_no_future_leakage_with_indexer() -> None:
 
     x = torch.randn(1, cfg.block_size, cfg.d_model)
     with torch.no_grad():
-        out_a = attn(x)
+        out_a, _ = attn(x)
     x2 = x.clone()
     x2[:, -1, :] += 10.0
     with torch.no_grad():
-        out_b = attn(x2)
+        out_b, _ = attn(x2)
 
     # Same reasoning as Stage 2's no-future-leakage test: positions 0..11
     # never attend to block 3 (which contains positions 12..15).
@@ -463,25 +463,24 @@ def test_stage4_W_DQ_feeds_core_queries() -> None:
     attn.eval_apply_topk = False  # also disable to be safe
     x = torch.randn(1, cfg.block_size, cfg.d_model)
     with torch.no_grad():
-        out_a = attn(x)
+        out_a, _ = attn(x)
         # Perturb W_DQ — c^Q changes, so both indexer queries AND core queries change.
         attn.indexer.W_DQ.weight.add_(0.5 * torch.randn_like(attn.indexer.W_DQ.weight))
-        out_b = attn(x)
+        out_b, _ = attn(x)
     assert not torch.allclose(out_a, out_b, atol=1e-5), (
         "perturbing W_DQ should change attention output (c^Q feeds core queries in Stage 4)"
     )
 
 
 def test_stage4_zero_W_UQ_zeros_attention_output_post_first_m() -> None:
-    """If W_UQ is zero, core queries are zero, so q·K = 0 — but the indexer
-    additive bias still gives a non-uniform softmax. The attention output
-    is then a weighted average of K=V values per indexer scores. This is
-    well-defined and not identically zero (so it doesn't replicate the
-    first-m-positions zeroing).
+    """If W_UQ is zero, core queries are zero, so q·K = 0 and every logit is
+    zero. softmax over the causally-valid blocks then yields a uniform
+    distribution, and the attention output is the uniform average of the
+    K=V compressed blocks. That's well-defined and not identically zero.
 
-    The point of this test: if the test_attention_first_m_output_is_zero
-    invariant from Stage 2 still holds with W_UQ zeroed, we know the
-    first-m guard is robust to the new query path."""
+    The point of this test: the first-m-positions zero invariant from
+    Stage 2 must still hold with W_UQ zeroed — proving the safe-softmax
+    guard is robust to a degenerate query path."""
     cfg = _indexer_cfg(block_size=16, csa_m=4, csa_top_k=99)
     attn = model.CSAAttention(cfg)
     attn.eval_apply_topk = False
@@ -489,7 +488,7 @@ def test_stage4_zero_W_UQ_zeros_attention_output_post_first_m() -> None:
         attn.W_UQ.weight.zero_()
     x = torch.randn(2, cfg.block_size, cfg.d_model)
     with torch.no_grad():
-        out = attn(x)
+        out, _ = attn(x)
     # First m positions still exactly zero (causal mask + safe softmax).
     torch.testing.assert_close(
         out[:, :cfg.csa_m, :], torch.zeros(2, cfg.csa_m, cfg.d_model),
@@ -497,6 +496,130 @@ def test_stage4_zero_W_UQ_zeros_attention_output_post_first_m() -> None:
     )
     # Position m onwards is non-zero (driven by indexer-only attention).
     assert out[:, cfg.csa_m:, :].abs().max().item() > 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: V3.2-style indexer KL loss + gradient isolation
+# ---------------------------------------------------------------------------
+
+
+def _kl_isolation_grad(loss: torch.Tensor) -> None:
+    """Backward, populating .grad on every leaf that participated."""
+    loss.backward()
+
+
+def test_indexer_kl_gradient_isolation() -> None:
+    """L_LM gradient must not flow into indexer-specific params (W_IUQ, W_w,
+    indexer compressor). L_I gradient must not flow into main-model params
+    (W_DQ, W_UQ, main compress, W_O, FFN, embeddings, norms). The detach in
+    CSAIndexer.forward is what makes this hold."""
+    cfg = _indexer_cfg(block_size=16, csa_m=4, vocab_size=10, n_layers=1)
+    m = model.MiniTransformer(cfg)
+
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    tgt = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    loss_mask = torch.ones((2, cfg.block_size), dtype=torch.float)
+    loss_mask[:, : cfg.csa_m] = 0.0
+
+    block = m.blocks[0]
+    attn = block.attn
+    indexer = attn.indexer
+
+    indexer_specific = {
+        "indexer.W_IUQ": indexer.W_IUQ.weight,
+        "indexer.W_w": indexer.W_w.weight,
+        "indexer.compress_indexer.W_aKV": indexer.compress_indexer.W_aKV.weight,
+        "indexer.compress_indexer.W_bKV": indexer.compress_indexer.W_bKV.weight,
+        "indexer.compress_indexer.W_aZ": indexer.compress_indexer.W_aZ.weight,
+        "indexer.compress_indexer.W_bZ": indexer.compress_indexer.W_bZ.weight,
+        "indexer.compress_indexer.B_a": indexer.compress_indexer.B_a,
+        "indexer.compress_indexer.B_b": indexer.compress_indexer.B_b,
+    }
+    main_only = {
+        "indexer.W_DQ": indexer.W_DQ.weight,
+        "attn.W_UQ": attn.W_UQ.weight,
+        "attn.compress.W_aKV": attn.compress.W_aKV.weight,
+        "attn.W_O": attn.W_O.weight,
+        "tok_embed": m.tok_embed.weight,
+        "pos_embed": m.pos_embed.weight,
+    }
+
+    # ---- 1. L_LM backward only ----
+    _, lm_loss, indexer_loss = m(idx, tgt, loss_mask=loss_mask)
+    assert lm_loss is not None and indexer_loss is not None
+    m.zero_grad(set_to_none=True)
+    _kl_isolation_grad(lm_loss)
+
+    for name, p in indexer_specific.items():
+        grad_norm = 0.0 if p.grad is None else p.grad.abs().sum().item()
+        assert grad_norm == 0.0, f"L_LM leaked into {name}: |grad|={grad_norm}"
+    for name, p in main_only.items():
+        grad_norm = 0.0 if p.grad is None else p.grad.abs().sum().item()
+        assert grad_norm > 0.0, f"L_LM did not reach {name} (expected nonzero grad)"
+
+    # ---- 2. L_I backward only (fresh forward to rebuild graph) ----
+    _, lm_loss, indexer_loss = m(idx, tgt, loss_mask=loss_mask)
+    m.zero_grad(set_to_none=True)
+    _kl_isolation_grad(indexer_loss)
+
+    for name, p in main_only.items():
+        grad_norm = 0.0 if p.grad is None else p.grad.abs().sum().item()
+        assert grad_norm == 0.0, f"L_I leaked into {name}: |grad|={grad_norm}"
+    # Indexer params: most should receive L_I grad. Allow some to be zero
+    # only if a specific structural reason exists; otherwise expect nonzero.
+    for name, p in indexer_specific.items():
+        grad_norm = 0.0 if p.grad is None else p.grad.abs().sum().item()
+        assert grad_norm > 0.0, f"L_I did not reach {name}"
+
+
+def test_minitransformer_returns_three_values() -> None:
+    """forward returns (logits, lm_loss, indexer_loss); indexer_loss is a
+    finite tensor for CSA and None for vanilla."""
+    # CSA
+    cfg = _indexer_cfg(block_size=16, csa_m=4, vocab_size=10, n_layers=1)
+    m = model.MiniTransformer(cfg)
+    idx = torch.randint(0, cfg.vocab_size, (1, cfg.block_size))
+    tgt = torch.randint(0, cfg.vocab_size, (1, cfg.block_size))
+    logits, lm_loss, indexer_loss = m(idx, tgt)
+    assert logits.shape == (1, cfg.block_size, cfg.vocab_size)
+    assert lm_loss is not None and torch.isfinite(lm_loss).item()
+    assert indexer_loss is not None and torch.isfinite(indexer_loss).item()
+    # vanilla
+    vcfg = model.ModelConfig(
+        vocab_size=10, d_model=16, n_layers=1, n_heads=2,
+        block_size=16, attention="vanilla",
+    )
+    vm = model.MiniTransformer(vcfg)
+    _, vlm, vix = vm(idx, tgt)
+    assert vlm is not None and vix is None
+
+
+def test_indexer_loss_zero_when_indexer_matches_attention() -> None:
+    """Sanity check the KL: if the indexer's softmax already equals p, L_I
+    should be ~0. We construct this by zeroing the indexer-specific params
+    so the indexer scores are identically zero; softmax(0..0) is uniform
+    over n_blk. p is the uniform-over-valid attention distribution only
+    when attention scores happen to make it so — that's hard to force.
+
+    Easier: zero W_w. Then indexer scores are all zero per (t, s). softmax
+    over the causally-masked positions (rest are -inf) gives uniform over
+    valid blocks. If the attention output p is ALSO uniform over the same
+    valid blocks, KL = 0. We force this by making the queries zero (zero
+    W_UQ): then core_scores=0, softmax over valid blocks is uniform — and
+    p = head-sum/n_h normalized = uniform too. So KL = 0 for every t >= m."""
+    cfg = _indexer_cfg(block_size=16, csa_m=4, vocab_size=10, n_layers=1)
+    m = model.MiniTransformer(cfg)
+    block = m.blocks[0]
+    with torch.no_grad():
+        block.attn.W_UQ.weight.zero_()          # core queries -> 0 -> p uniform over valid
+        block.attn.indexer.W_w.weight.zero_()   # indexer scores -> 0 -> softmax(I) uniform over valid
+
+    idx = torch.randint(0, cfg.vocab_size, (1, cfg.block_size))
+    tgt = torch.randint(0, cfg.vocab_size, (1, cfg.block_size))
+    loss_mask = torch.ones((1, cfg.block_size), dtype=torch.float)
+    loss_mask[:, : cfg.csa_m] = 0.0
+    _, _, indexer_loss = m(idx, tgt, loss_mask=loss_mask)
+    assert indexer_loss.item() < 1e-5, f"expected ~0 KL when distributions match, got {indexer_loss.item()}"
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +650,10 @@ def _run_all() -> None:
         test_stage4_uses_w_uq_not_w_q,
         test_stage4_W_DQ_feeds_core_queries,
         test_stage4_zero_W_UQ_zeros_attention_output_post_first_m,
+        # Stage 5: V3.2 indexer KL training + gradient isolation
+        test_indexer_kl_gradient_isolation,
+        test_minitransformer_returns_three_values,
+        test_indexer_loss_zero_when_indexer_matches_attention,
     ]
     failed = 0
     for t in tests:

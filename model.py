@@ -208,9 +208,14 @@ class CSAIndexer(nn.Module):
     The shared latent `c^Q` is exposed (returned alongside the scores) so
     Stage 4's core-query path can reuse it via W^UQ.
 
-    Note on training signal (D3): Stage 3 wires the scores `I` as additive
-    logits to core attention so the indexer receives gradient. Top-k
-    selection is applied only at eval to match the deployment regime.
+    Training signal (Stage 5, V3.2 scheme): the indexer is trained by an
+    auxiliary KL loss aligning softmax(I_{t,:}) with the L1-normalized
+    head-summed dense-attention distribution p_{t,:}. The indexer no
+    longer feeds the core attention's logits; it only drives top-k
+    selection of compressed blocks (eq. 17, applied at eval and during
+    sparse-training phases). The indexer's input is detached in
+    CSAIndexer.forward so L_I doesn't push gradients back into the
+    upstream main-model path.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
@@ -228,10 +233,16 @@ class CSAIndexer(nn.Module):
         self.compress_indexer = CSACompression(cfg.d_model, cfg.csa_c_i, cfg.csa_m)
 
     def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # c_q is the shared latent; it MUST flow back to W_DQ from the
+        # main-attention path (W_UQ in CSAAttention), so we leave it
+        # un-detached on the way out. For the indexer's *local* use of c_q
+        # (and h), we detach so L_I doesn't push gradient into W_DQ or
+        # upstream. This is the V3.2 "detach the indexer input" trick
+        # adapted to the V4 shared-latent design.
         c_q = self.W_DQ(h)                                                  # (b, n, d_c)
-        q_i = rearrange(self.W_IUQ(c_q), "b n (h c) -> b n h c", h=self.n_h_i)
-        w_i = self.W_w(h)                                                   # (b, n, n_h_i)
-        K_iComp = self.compress_indexer(h)                                  # (b, n_blk, c_i)
+        q_i = rearrange(self.W_IUQ(c_q.detach()), "b n (h c) -> b n h c", h=self.n_h_i)
+        w_i = self.W_w(h.detach())                                          # (b, n, n_h_i)
+        K_iComp = self.compress_indexer(h.detach())                         # (b, n_blk, c_i)
         # eq. 16: per-head ReLU dot product, then per-head weighted sum.
         # einsum: (b, n, h, c_i) x (b, n_blk, c_i) -> (b, n, h, n_blk)
         dots = einsum(q_i, K_iComp, "b n h c, b s c -> b n h s")
@@ -252,10 +263,11 @@ class CSAAttention(nn.Module):
     bottleneck, exactly as the paper specifies, and trims params (the old
     W_Q was d × n_h·c; W^UQ is only d_c × n_h·c, with d_c = d/2).
 
-    Indexer scores `I[t, s]` are added as a per-block additive bias to the
-    core attention logits during BOTH train and eval, so the indexer
-    receives gradient. At eval, a top-k mask additionally restricts
-    attention to the `csa_top_k` highest-scoring blocks per query (D3).
+    Indexer scores `I[t, s]` no longer feed back into the core-attention
+    logits — that additive-bias coupling (our Stage-3 D3 invention) is
+    replaced by the V3.2-style auxiliary KL loss computed at MiniTransformer
+    level. At eval, indexer scores still drive a top-k mask restricting
+    core attention to the `csa_top_k` highest-scoring blocks per query.
 
     Causal mask: query at token t may only attend to compressed blocks
     s < floor(t/m). Positions t < m have no causally-valid block — their
@@ -282,7 +294,11 @@ class CSAAttention(nn.Module):
         self.k_norm = RMSNorm(cfg.csa_c)
         self.W_O = nn.Linear(cfg.n_heads * cfg.csa_c, cfg.d_model, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Returns (residual_delta, aux) where aux holds tensors needed by the
+        V3.2 indexer KL loss at MiniTransformer level: `p` (teacher target,
+        detached) and `I_masked` (indexer scores with -inf on causally-invalid
+        blocks)."""
         n = x.shape[1]
         m, c = self.m, self.c
         n_blk = n // m
@@ -298,10 +314,9 @@ class CSAAttention(nn.Module):
         kv = self.compress(x)        # (b, n_blk, c)
         kv = self.k_norm(kv)
 
-        # Core attention logits + indexer-as-additive-bias. The indexer
-        # contributes equally to every query head (broadcast over h).
-        core_scores = einsum(q, kv, "b n h c, b s c -> b h n s") / math.sqrt(c)
-        scores = core_scores + indexer_scores.unsqueeze(1)                  # (b, h, n, n_blk)
+        # Core attention logits. Indexer scores no longer feed back as an
+        # additive bias — they only drive eval-time top-k selection below.
+        scores = einsum(q, kv, "b n h c, b s c -> b h n s") / math.sqrt(c)  # (b, h, n, n_blk)
 
         # Causal mask: token index t may attend to blocks s < t // m.
         device = x.device
@@ -310,9 +325,9 @@ class CSAAttention(nn.Module):
         causal = block_idx < (token_idx // m)                               # (n, n_blk)
         scores = scores.masked_fill(~causal, float("-inf"))
 
-        # Top-k selection at eval (D3). The indexer's CAUSALLY-MASKED scores
-        # decide which blocks survive; the same set is applied to all query
-        # heads (matches MQA: all heads share K=V).
+        # Top-k selection (eval / sparse-training phase). Indexer's
+        # causally-masked scores choose which blocks survive; same set
+        # applied to all query heads (MQA: all heads share K=V).
         if (not self.training) and self.eval_apply_topk and self.top_k < n_blk:
             masked_idx = indexer_scores.masked_fill(~causal, float("-inf"))
             _, topk_idx = masked_idx.topk(k=self.top_k, dim=-1)             # (b, n, k)
@@ -326,9 +341,23 @@ class CSAAttention(nn.Module):
         attn = F.softmax(scores, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0)
 
+        # V3.2 eq. 3: teacher target p_{t,:} = L1-normalize_seq(sum_h attn).
+        # Detached so L_I doesn't push gradient back into the attention path
+        # (we want the indexer to chase attention, not the other way around).
+        # Rows for positions t < m have attn = 0, so the sum is 0 and the
+        # L1-normalization yields a zero row — those positions contribute
+        # nothing to KL (and are loss-masked anyway).
+        p = attn.sum(dim=1)                                                  # (b, n, n_blk)
+        p_sum = p.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        p = (p / p_sum).detach()
+
         out = einsum(attn, kv, "b h n s, b s c -> b h n c")
         out = rearrange(out, "b h n c -> b n (h c)")
-        return self.W_O(out)
+        aux = {
+            "p": p,
+            "I_masked": indexer_scores.masked_fill(~causal, float("-inf")),
+        }
+        return self.W_O(out), aux
 
 
 def _build_attention(cfg: ModelConfig) -> nn.Module:
@@ -347,10 +376,18 @@ class TransformerBlock(nn.Module):
         self.norm_ffn = RMSNorm(cfg.d_model)
         self.ffn = SwiGLU(cfg.d_model, cfg.d_ff)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm_attn(x))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Returns (x, aux). aux is the CSA layer's indexer-KL inputs, or None
+        for vanilla attention."""
+        h = self.norm_attn(x)
+        if isinstance(self.attn, CSAAttention):
+            attn_out, aux = self.attn(h)
+        else:
+            attn_out = self.attn(h)
+            aux = None
+        x = x + attn_out
         x = x + self.ffn(self.norm_ffn(x))
-        return x
+        return x, aux
 
 
 # ---------------------------------------------------------------------------
@@ -386,28 +423,78 @@ class MiniTransformer(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Returns (logits, lm_loss, indexer_loss).
+
+        `indexer_loss` is the V3.2 auxiliary KL loss (eq. 3) summed across
+        CSA layers and averaged over valid positions; None when no CSA
+        layers exist or when targets is None. The two losses are kept
+        separate so the trainer can implement the V3.2 two-phase schedule:
+        phase-1 indexer-only backward, phase-2 joint backward.
+        """
         b, n = idx.shape
         assert n <= self.cfg.block_size, f"sequence length {n} > block_size {self.cfg.block_size}"
         pos = torch.arange(n, device=idx.device)
         x = self.tok_embed(idx) + self.pos_embed(pos)
+        auxes: list[dict[str, torch.Tensor]] = []
         for block in self.blocks:
-            x = block(x)
+            x, aux = block(x)
+            if aux is not None:
+                auxes.append(aux)
         x = self.norm_f(x)
         logits = self.lm_head(x)
 
-        loss = None
+        lm_loss = None
         if targets is not None:
-            loss = F.cross_entropy(
+            ce = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
                 reduction="none",
             ).view(b, n)
             if loss_mask is not None:
-                loss = (loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
+                lm_loss = (ce * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
             else:
-                loss = loss.mean()
-        return logits, loss
+                lm_loss = ce.mean()
+
+        indexer_loss = None
+        if auxes and targets is not None:
+            indexer_loss = self._indexer_kl_loss(auxes, loss_mask)
+        return logits, lm_loss, indexer_loss
+
+    def _indexer_kl_loss(
+        self,
+        auxes: list[dict[str, torch.Tensor]],
+        loss_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """V3.2 eq. 3: L^I = sum_t D_KL(p_{t,:} || softmax(I_{t,:})),
+        averaged across CSA layers and valid query positions.
+
+        `p` is detached at the CSAAttention level. We mask invalid (t<m)
+        positions out so they contribute zero gradient to the indexer.
+        """
+        total = 0.0
+        for aux in auxes:
+            p = aux["p"]              # (b, n, n_blk); zero rows for t < m
+            I_m = aux["I_masked"]     # (b, n, n_blk); -inf on causally invalid blocks
+
+            log_q = F.log_softmax(I_m, dim=-1)
+            # log_q is NaN for fully-invalid rows (t<m). Zero them; those rows
+            # have p=0 anyway and their contribution to KL is 0.
+            log_q = torch.nan_to_num(log_q, nan=0.0, neginf=0.0)
+
+            log_p = torch.log(p.clamp_min(1e-30))
+            # contribution per (b, n, s); convention 0 * anything = 0.
+            contrib = p * (log_p - log_q)
+            contrib = torch.where(p > 0, contrib, torch.zeros_like(contrib))
+            kl_per_pos = contrib.sum(dim=-1)                    # (b, n)
+
+            if loss_mask is not None:
+                kl_per_pos = kl_per_pos * loss_mask
+                norm = loss_mask.sum().clamp_min(1.0)
+            else:
+                norm = torch.tensor(kl_per_pos.numel(), device=kl_per_pos.device)
+            total = total + kl_per_pos.sum() / norm
+        return total / len(auxes)
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0) -> torch.Tensor:
@@ -422,7 +509,7 @@ class MiniTransformer(nn.Module):
             if pad_len:
                 pad = idx_cond.new_zeros(idx_cond.shape[0], pad_len)
                 idx_cond = torch.cat([pad, idx_cond], dim=1)
-            logits, _ = self.forward(idx_cond)
+            logits, _, _ = self.forward(idx_cond)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
             probs = F.softmax(logits, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
