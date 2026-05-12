@@ -30,6 +30,7 @@ RUNS_DIR = Path(__file__).parent / "runs"
 class TrainConfig:
     attention: str = "vanilla"
     run_name: str = "baseline"
+    dataset: str = "tinyshakespeare"   # "tinyshakespeare" | "enwiki8"
 
     # model
     d_model: int = 384
@@ -189,8 +190,12 @@ def train(cfg: TrainConfig) -> None:
 
     print(f"[setup] device={device}")
 
-    ds = data.load()
-    print(f"[data]  vocab={ds.vocab_size}, train={len(ds.train):,} tokens, val={len(ds.val):,}")
+    ds = data.load(cfg.dataset)
+    test_str = f", test={len(ds.test):,}" if ds.test is not None else ""
+    print(
+        f"[data]  {cfg.dataset}  vocab={ds.vocab_size}, "
+        f"train={len(ds.train):,} tokens, val={len(ds.val):,}{test_str}"
+    )
 
     mcfg = model.ModelConfig(
         vocab_size=ds.vocab_size,
