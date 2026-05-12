@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import time
@@ -57,6 +58,10 @@ class TrainConfig:
     warmup_iters: int = 100
     weight_decay: float = 0.1
     grad_clip: float = 1.0
+    grad_accum_steps: int = 1   # accumulate gradients over this many micro-batches per opt step
+
+    # mixed precision
+    amp: str = "none"           # "none" | "bf16"  (bf16 halves activation memory)
 
     # misc
     seed: int = 1337
@@ -112,6 +117,20 @@ def _set_csa_topk(m: torch.nn.Module, enabled: bool) -> None:
             module.eval_apply_topk = enabled
 
 
+def _amp_ctx(cfg: TrainConfig, device: torch.device):
+    """Return an autocast context for forward+loss computation.
+
+    bf16 halves activation memory and ~2x throughput on Ampere+. softmax
+    and layer-norm stay in fp32 under autocast (PyTorch's default cast
+    policy), so the safe-softmax + nan_to_num path in CSAAttention is
+    unaffected. Gradient clipping and the optimizer step run on
+    fp32 master weights regardless.
+    """
+    if cfg.amp == "bf16" and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 @torch.no_grad()
 def evaluate(
     m: model.MiniTransformer,
@@ -131,6 +150,7 @@ def evaluate(
     # Dense matches the training regime; top-k matches the deployment regime.
     # Use the same batches for both so the comparison is paired.
     is_csa = cfg.attention == "csa"
+    amp_ctx = _amp_ctx(cfg, device)
     out: dict[str, float] = {}
     for split_name, split_data in (("train", ds.train), ("val", ds.val)):
         dense_losses = torch.zeros(cfg.eval_iters)
@@ -138,17 +158,18 @@ def evaluate(
         indexer_losses = torch.zeros(cfg.eval_iters) if is_csa else None
         for i in range(cfg.eval_iters):
             x, y = data.get_batch(split_data, cfg.block_size, cfg.batch_size, device)
-            if is_csa:
-                _set_csa_topk(m, False)
-                _, lm_loss, idx_loss = m(x, y, loss_mask=loss_mask)
-                dense_losses[i] = lm_loss.item()
-                indexer_losses[i] = idx_loss.item()
-                _set_csa_topk(m, True)
-                _, lm_loss, _ = m(x, y, loss_mask=loss_mask)
-                topk_losses[i] = lm_loss.item()
-            else:
-                _, lm_loss, _ = m(x, y, loss_mask=loss_mask)
-                dense_losses[i] = lm_loss.item()
+            with amp_ctx:
+                if is_csa:
+                    _set_csa_topk(m, False)
+                    _, lm_loss, idx_loss = m(x, y, loss_mask=loss_mask)
+                    dense_losses[i] = lm_loss.item()
+                    indexer_losses[i] = idx_loss.item()
+                    _set_csa_topk(m, True)
+                    _, lm_loss, _ = m(x, y, loss_mask=loss_mask)
+                    topk_losses[i] = lm_loss.item()
+                else:
+                    _, lm_loss, _ = m(x, y, loss_mask=loss_mask)
+                    dense_losses[i] = lm_loss.item()
         # Primary metric: dense (matches training regime). Top-k surfaces
         # the train/eval gap when CSA is deployed sparsely.
         out[f"{split_name}_loss"] = dense_losses.mean().item()
@@ -234,6 +255,12 @@ def train(cfg: TrainConfig) -> None:
     train_mask_first = cfg.csa_m if cfg.attention == "csa" else 0
     train_loss_mask = make_loss_mask(cfg.batch_size, cfg.block_size, train_mask_first, device)
 
+    amp_ctx = _amp_ctx(cfg, device)
+    print(
+        f"[opt]   amp={cfg.amp}, grad_accum_steps={cfg.grad_accum_steps}, "
+        f"effective_batch={cfg.batch_size * cfg.grad_accum_steps}"
+    )
+
     m.train()
     t0 = time.time()
     tokens_seen = 0
@@ -262,43 +289,57 @@ def train(cfg: TrainConfig) -> None:
         if step == cfg.max_iters:
             break
 
-        # train step
+        # train step — one optimizer step accumulating grad_accum_steps micro-batches.
         lr = lr_at(step, cfg)
         for g in optimizer.param_groups:
             g["lr"] = lr
-
-        x, y = data.get_batch(ds.train, cfg.block_size, cfg.batch_size, device)
-        _, lm_loss, indexer_loss = m(x, y, loss_mask=train_loss_mask)
-        # V3.2 two-phase schedule:
-        #   Phase 1 (warmup, step < indexer_warmup_iters): backward only L_I,
-        #     so only indexer params receive gradient. Main model is "frozen"
-        #     by never receiving a gradient (AdamW skips params with .grad=None).
-        #   Phase 2 (joint): backward L_LM + L_I; the detach in CSAIndexer.forward
-        #     keeps the two flows isolated to their respective params.
-        # For vanilla attention there's no indexer, so we always backward L_LM.
-        in_warmup = (indexer_loss is not None) and (step < cfg.indexer_warmup_iters)
-        if in_warmup:
-            loss = indexer_loss
-        elif indexer_loss is not None:
-            loss = lm_loss + indexer_loss
-        else:
-            loss = lm_loss
-
+        in_warmup = (cfg.attention == "csa") and (step < cfg.indexer_warmup_iters)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+
+        sum_lm = 0.0
+        sum_indexer = 0.0
+        n_indexer = 0
+        for _micro in range(cfg.grad_accum_steps):
+            x, y = data.get_batch(ds.train, cfg.block_size, cfg.batch_size, device)
+            with amp_ctx:
+                _, lm_loss, indexer_loss = m(x, y, loss_mask=train_loss_mask)
+                # V3.2 two-phase schedule:
+                #   Phase 1 (warmup): backward only L_I, so only indexer params
+                #     receive gradient (main model is "frozen" via grad=None,
+                #     which AdamW skips).
+                #   Phase 2 (joint): backward L_LM + L_I; the detach in
+                #     CSAIndexer.forward keeps the gradient flows isolated.
+                # Vanilla attention has no indexer, so we always backward L_LM.
+                if in_warmup:
+                    loss = indexer_loss
+                elif indexer_loss is not None:
+                    loss = lm_loss + indexer_loss
+                else:
+                    loss = lm_loss
+                loss = loss / cfg.grad_accum_steps
+            loss.backward()
+
+            sum_lm += lm_loss.item()
+            if indexer_loss is not None:
+                sum_indexer += indexer_loss.item()
+                n_indexer += 1
+            tokens_seen += x.numel()
+
         grad_norm = torch.nn.utils.clip_grad_norm_(m.parameters(), cfg.grad_clip)
         optimizer.step()
 
-        tokens_seen += x.numel()
+        avg_lm = sum_lm / cfg.grad_accum_steps
+        avg_indexer = (sum_indexer / n_indexer) if n_indexer > 0 else None
 
         if step % 50 == 0 and step > 0:
             dt = time.time() - step_t0
-            tok_per_s = (cfg.batch_size * cfg.block_size * (step - last_log_step)) / dt
+            steps_done = step - last_log_step
+            tok_per_s = (cfg.batch_size * cfg.grad_accum_steps * cfg.block_size * steps_done) / dt
             entry = {
                 "step": step,
                 "kind": "train",
-                "loss": lm_loss.item(),
-                "indexer_loss": indexer_loss.item() if indexer_loss is not None else None,
+                "loss": avg_lm,
+                "indexer_loss": avg_indexer,
                 "phase": 1 if in_warmup else 2,
                 "lr": lr,
                 "grad_norm": grad_norm.item(),
@@ -308,10 +349,10 @@ def train(cfg: TrainConfig) -> None:
             log_f.write(json.dumps(entry) + "\n")
             log_f.flush()
             extra = ""
-            if indexer_loss is not None:
-                extra = f"  L_I {indexer_loss.item():.4f}  phase {1 if in_warmup else 2}"
+            if avg_indexer is not None:
+                extra = f"  L_I {avg_indexer:.4f}  phase {1 if in_warmup else 2}"
             print(
-                f"[train] step {step:5d}  loss {lm_loss.item():.4f}{extra}  "
+                f"[train] step {step:5d}  loss {avg_lm:.4f}{extra}  "
                 f"lr {lr:.2e}  grad {grad_norm.item():.2f}  "
                 f"tok/s {tok_per_s:,.0f}"
             )
