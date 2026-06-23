@@ -1,0 +1,31 @@
+[setup] device=cuda
+[data]  enwiki8  vocab=205, train=90,000,000 tokens, val=5,000,000, test=5,000,000
+[model] csa, params=13,084,416 (excl emb=9,859,968)
+[run]   logging to /home/cypher/a_repos/BrettCleary/mini-deepseek-v4/runs/csa-stage5-enwiki8-8k
+[opt]   amp=bf16, grad_accum_steps=32, effective_batch=32
+[eval]  step     0  train 5.3513 (ppl 210.87)  val 5.3422 (ppl 208.97)  val(topk) 5.3477 (ppl 210.12)  L_I 0.0331
+[train] step    50  loss 5.3518  L_I 0.0243  phase 1  lr 1.53e-04  grad 0.03  tok/s 81,105
+[train] step   100  loss 5.3513  L_I 0.0181  phase 2  lr 3.00e-04  grad 11.65  tok/s 89,878
+[train] step   150  loss 2.8802  L_I 0.0596  phase 2  lr 2.98e-04  grad 0.52  tok/s 46,633
+[eval]  step   200  train 2.6918 (ppl 14.76)  val 2.6695 (ppl 14.43)  val(topk) 2.7074 (ppl 14.99)  L_I 0.0644
+[train] step   200  loss 2.6915  L_I 0.0658  phase 2  lr 2.92e-04  grad 0.69  tok/s 45,097
+[train] step   250  loss 2.5872  L_I 0.0664  phase 2  lr 2.82e-04  grad 0.48  tok/s 46,764
+[train] step   300  loss 2.5672  L_I 0.0609  phase 2  lr 2.68e-04  grad 0.46  tok/s 46,292
+[train] step   350  loss 2.5208  L_I 0.0650  phase 2  lr 2.52e-04  grad 0.48  tok/s 46,582
+[eval]  step   400  train 2.4956 (ppl 12.13)  val 2.5127 (ppl 12.34)  val(topk) 2.5801 (ppl 13.20)  L_I 0.0570
+[train] step   400  loss 2.5192  L_I 0.0571  phase 2  lr 2.32e-04  grad 0.54  tok/s 44,111
+[train] step   450  loss 2.4474  L_I 0.0545  phase 2  lr 2.11e-04  grad 0.98  tok/s 46,740
+[train] step   500  loss 2.4110  L_I 0.0545  phase 2  lr 1.88e-04  grad 0.76  tok/s 47,053
+[train] step   550  loss 2.4004  L_I 0.0467  phase 2  lr 1.65e-04  grad 0.61  tok/s 47,178
+[eval]  step   600  train 2.4122 (ppl 11.16)  val 2.4244 (ppl 11.30)  val(topk) 2.5087 (ppl 12.29)  L_I 0.0439
+[train] step   600  loss 2.4098  L_I 0.0439  phase 2  lr 1.42e-04  grad 0.78  tok/s 44,717
+[train] step   650  loss 2.3444  L_I 0.0433  phase 2  lr 1.19e-04  grad 0.60  tok/s 47,468
+[train] step   700  loss 2.3705  L_I 0.0375  phase 2  lr 9.75e-05  grad 0.78  tok/s 47,790
+[train] step   750  loss 2.3642  L_I 0.0362  phase 2  lr 7.82e-05  grad 0.72  tok/s 47,886
+[eval]  step   800  train 2.3708 (ppl 10.71)  val 2.3395 (ppl 10.38)  val(topk) 2.4664 (ppl 11.78)  L_I 0.0353
+[train] step   800  loss 2.4043  L_I 0.0313  phase 2  lr 6.16e-05  grad 0.51  tok/s 45,695
+[train] step   850  loss 2.4002  L_I 0.0309  phase 2  lr 4.81e-05  grad 0.53  tok/s 48,185
+[train] step   900  loss 2.4051  L_I 0.0341  phase 2  lr 3.81e-05  grad 0.62  tok/s 48,189
+[train] step   950  loss 2.3776  L_I 0.0307  phase 2  lr 3.21e-05  grad 0.52  tok/s 48,206
+[eval]  step  1000  train 2.3345 (ppl 10.32)  val 2.3716 (ppl 10.71)  val(topk) 2.4905 (ppl 12.07)  L_I 0.0298
+[done] saved /home/cypher/a_repos/BrettCleary/mini-deepseek-v4/runs/csa-stage5-enwiki8-8k/final.pt  total 5359.2s
