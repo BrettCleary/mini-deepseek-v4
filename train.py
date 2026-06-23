@@ -63,6 +63,11 @@ class TrainConfig:
     # mixed precision
     amp: str = "none"           # "none" | "bf16"  (bf16 halves activation memory)
 
+    # early stop: stop when val_loss hasn't improved for `early_stop_patience`
+    # consecutive evals (after LR warmup). 0 disables. Saves best.pt at the
+    # iter that achieved the lowest val_loss.
+    early_stop_patience: int = 0
+
     # misc
     seed: int = 1337
     compile: bool = False  # torch.compile; off by default for clarity in v1
@@ -172,15 +177,98 @@ def evaluate(
                     dense_losses[i] = lm_loss.item()
         # Primary metric: dense (matches training regime). Top-k surfaces
         # the train/eval gap when CSA is deployed sparsely.
-        out[f"{split_name}_loss"] = dense_losses.mean().item()
-        out[f"{split_name}_ppl"] = math.exp(dense_losses.mean().item())
+        avg_dense = dense_losses.mean().item()
+        out[f"{split_name}_loss"] = avg_dense
+        out[f"{split_name}_ppl"] = math.exp(avg_dense)
+        out[f"{split_name}_bpc"] = avg_dense / math.log(2)
         if is_csa:
-            out[f"{split_name}_loss_topk"] = topk_losses.mean().item()
-            out[f"{split_name}_ppl_topk"] = math.exp(topk_losses.mean().item())
+            avg_topk = topk_losses.mean().item()
+            out[f"{split_name}_loss_topk"] = avg_topk
+            out[f"{split_name}_ppl_topk"] = math.exp(avg_topk)
+            out[f"{split_name}_bpc_topk"] = avg_topk / math.log(2)
             out[f"{split_name}_indexer_kl"] = indexer_losses.mean().item()
     if is_csa:
         _set_csa_topk(m, True)  # restore default
     m.train()
+    return out
+
+
+@torch.no_grad()
+def evaluate_split_full(
+    m: model.MiniTransformer,
+    split_data: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> dict[str, float]:
+    """Deterministic full sweep over non-overlapping `block_size`-length windows
+    of `split_data`. Used for the canonical end-of-run numbers on val and test.
+
+    Accumulates per-batch loss weighted by the number of valid (loss-masked)
+    positions, so the reported mean is exactly the per-position log-loss over
+    the swept positions. bpc = loss / ln(2) is the standard enwiki8 metric.
+
+    For CSA, the first `csa_m` positions of every window are excluded (no
+    causally-valid block exists — D2). Vanilla scores every position.
+    """
+    m.eval()
+    is_csa = cfg.attention == "csa"
+    mask_first = cfg.csa_m if is_csa else 0
+    B = cfg.batch_size
+    L = cfg.block_size
+    amp_ctx = _amp_ctx(cfg, device)
+
+    n = split_data.numel()
+    # Each window needs L+1 tokens (x = [i:i+L], y = [i+1:i+L+1]).
+    starts = list(range(0, n - L - 1, L))  # non-overlapping; drops last partial
+
+    total_loss_dense = 0.0
+    total_loss_topk = 0.0
+    total_positions = 0
+
+    for batch_idx in range(0, len(starts), B):
+        batch_starts = starts[batch_idx : batch_idx + B]
+        bs = len(batch_starts)
+        x = torch.stack([split_data[s : s + L] for s in batch_starts]).to(device, non_blocking=True)
+        y = torch.stack([split_data[s + 1 : s + L + 1] for s in batch_starts]).to(device, non_blocking=True)
+
+        if mask_first > 0:
+            loss_mask = torch.ones((bs, L), device=device)
+            loss_mask[:, :mask_first] = 0.0
+            valid_pos = bs * (L - mask_first)
+        else:
+            loss_mask = None
+            valid_pos = bs * L
+
+        with amp_ctx:
+            if is_csa:
+                _set_csa_topk(m, False)
+                _, lm_loss_dense, _ = m(x, y, loss_mask=loss_mask)
+                _set_csa_topk(m, True)
+                _, lm_loss_topk, _ = m(x, y, loss_mask=loss_mask)
+                total_loss_dense += lm_loss_dense.item() * valid_pos
+                total_loss_topk += lm_loss_topk.item() * valid_pos
+            else:
+                _, lm_loss_dense, _ = m(x, y, loss_mask=loss_mask)
+                total_loss_dense += lm_loss_dense.item() * valid_pos
+        total_positions += valid_pos
+
+    if is_csa:
+        _set_csa_topk(m, True)
+    m.train()
+
+    avg_dense = total_loss_dense / max(1, total_positions)
+    out = {
+        "loss": avg_dense,
+        "ppl": math.exp(avg_dense),
+        "bpc": avg_dense / math.log(2),
+        "n_positions": total_positions,
+        "n_windows": len(starts),
+    }
+    if is_csa:
+        avg_topk = total_loss_topk / max(1, total_positions)
+        out["loss_topk"] = avg_topk
+        out["ppl_topk"] = math.exp(avg_topk)
+        out["bpc_topk"] = avg_topk / math.log(2)
     return out
 
 
@@ -266,25 +354,72 @@ def train(cfg: TrainConfig) -> None:
     tokens_seen = 0
     step_t0 = time.time()
     last_log_step = 0
+    best_val = float("inf")
+    best_step = 0
+    evals_since_best = 0
+    stopped_early = False
 
     for step in range(cfg.max_iters + 1):
         # eval
         if step % cfg.eval_interval == 0:
             metrics = evaluate(m, ds, cfg, device)
             elapsed = time.time() - t0
-            entry = {"step": step, "kind": "eval", "elapsed_s": elapsed, **metrics}
+            val_loss = metrics["val_loss"]
+            if val_loss < best_val:
+                best_val = val_loss
+                best_step = step
+                evals_since_best = 0
+                torch.save(
+                    {"model_state": m.state_dict(), "config": asdict(mcfg), "step": step, "val_loss": val_loss},
+                    run_dir / "best.pt",
+                )
+            else:
+                evals_since_best += 1
+            entry = {
+                "step": step,
+                "kind": "eval",
+                "elapsed_s": elapsed,
+                "best_val": best_val,
+                "best_step": best_step,
+                "evals_since_best": evals_since_best,
+                **metrics,
+            }
             log_f.write(json.dumps(entry) + "\n")
             log_f.flush()
             line = (
                 f"[eval]  step {step:5d}  "
                 f"train {metrics['train_loss']:.4f} (ppl {metrics['train_ppl']:.2f})  "
-                f"val {metrics['val_loss']:.4f} (ppl {metrics['val_ppl']:.2f})"
+                f"val {val_loss:.4f} (ppl {metrics['val_ppl']:.2f})"
             )
             if "val_loss_topk" in metrics:
                 line += f"  val(topk) {metrics['val_loss_topk']:.4f} (ppl {metrics['val_ppl_topk']:.2f})"
             if "val_indexer_kl" in metrics:
                 line += f"  L_I {metrics['val_indexer_kl']:.4f}"
+            line += f"  best {best_val:.4f}@{best_step} ({evals_since_best}/{cfg.early_stop_patience or '-'})"
             print(line)
+
+            # Early stop: only arm after warmup so the high-LR ramp doesn't trip it.
+            if (
+                cfg.early_stop_patience > 0
+                and step >= cfg.warmup_iters
+                and evals_since_best >= cfg.early_stop_patience
+            ):
+                stop_entry = {
+                    "step": step,
+                    "kind": "early_stop",
+                    "elapsed_s": elapsed,
+                    "best_val": best_val,
+                    "best_step": best_step,
+                    "patience": cfg.early_stop_patience,
+                }
+                log_f.write(json.dumps(stop_entry) + "\n")
+                log_f.flush()
+                print(
+                    f"[stop]  early-stop at step {step}: val hasn't improved "
+                    f"in {evals_since_best} evals (best {best_val:.4f}@{best_step})"
+                )
+                stopped_early = True
+                break
 
         if step == cfg.max_iters:
             break
@@ -359,10 +494,57 @@ def train(cfg: TrainConfig) -> None:
             step_t0 = time.time()
             last_log_step = step
 
-    log_f.close()
     # save final checkpoint (small enough to be useful for downstream Stage 2 cmp)
     torch.save({"model_state": m.state_dict(), "config": asdict(mcfg)}, run_dir / "final.pt")
-    print(f"[done] saved {run_dir / 'final.pt'}  total {time.time() - t0:.1f}s")
+    msg = f"[done] saved {run_dir / 'final.pt'}  total {time.time() - t0:.1f}s"
+    if cfg.early_stop_patience > 0:
+        msg += f"  best_val={best_val:.4f}@step{best_step}"
+        if stopped_early:
+            msg += "  (early-stop)"
+        else:
+            msg += "  (hit max_iters cap)"
+    print(msg)
+
+    # Canonical end-of-run eval: reload best-val checkpoint, sweep val + test
+    # deterministically. This is the number that goes in the paper.
+    best_path = run_dir / "best.pt"
+    if best_path.exists():
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        m.load_state_dict(ckpt["model_state"])
+        ckpt_step = int(ckpt.get("step", -1))
+        print(f"[final] reloaded best.pt from step {ckpt_step}")
+        ckpt_source = "best"
+    else:
+        print("[final] no best.pt found, using final-step weights")
+        ckpt_source = "final"
+        ckpt_step = cfg.max_iters
+
+    final_entry = {
+        "kind": "final_eval",
+        "checkpoint": ckpt_source,
+        "checkpoint_step": ckpt_step,
+    }
+    for split_name in ("val", "test"):
+        split_data = getattr(ds, split_name, None)
+        if split_data is None:
+            continue
+        metrics = evaluate_split_full(m, split_data, cfg, device)
+        for k, v in metrics.items():
+            final_entry[f"{split_name}_{k}"] = v
+        line = (
+            f"[final] {split_name}: loss {metrics['loss']:.4f}  "
+            f"bpc {metrics['bpc']:.4f}  ppl {metrics['ppl']:.2f}  "
+            f"(n_pos {metrics['n_positions']:,}, windows {metrics['n_windows']})"
+        )
+        if "bpc_topk" in metrics:
+            line += (
+                f"  ||  topk: loss {metrics['loss_topk']:.4f}  "
+                f"bpc {metrics['bpc_topk']:.4f}  ppl {metrics['ppl_topk']:.2f}"
+            )
+        print(line)
+    log_f.write(json.dumps(final_entry) + "\n")
+    log_f.flush()
+    log_f.close()
 
 
 if __name__ == "__main__":
