@@ -42,13 +42,17 @@ case "$cmd" in
         ;;
     pull)
         mkdir -p runs
-        # Pull only the v3 sweep dirs + sweep log. Leaves local v1/v2 untouched.
-        rsync -avz "$host:$REMOTE_DIR/runs/stage-e-v3-*" runs/
-        rsync -avz "$host:$REMOTE_DIR/runs/stage-e-v3-sweep.log" runs/ || true
-        echo "[pull] done. runs/stage-e-v3-*/ updated."
+        # Pull all stage-e-v3* run dirs + any sweep logs in runs/. Leaves
+        # local v1/v2 untouched. The * glob matches both stage-e-v3-* and
+        # stage-e-v3-1-* (and any future v3.x).
+        rsync -avz "$host:$REMOTE_DIR/runs/stage-e-v3*" runs/
+        rsync -avz "$host:$REMOTE_DIR/runs/run_stage_e_*.log" runs/ 2>/dev/null || true
+        rsync -avz "$host:$REMOTE_DIR/runs/stage-e-*.log" runs/ 2>/dev/null || true
+        echo "[pull] done. runs/stage-e-v3*/ updated."
         ;;
     log)
-        ssh "$host" "tail -f $REMOTE_DIR/runs/stage-e-v3-sweep.log"
+        # Tail the most-recently-modified sweep log on the remote.
+        ssh "$host" "tail -f \$(ls -t $REMOTE_DIR/runs/run_stage_e_*.log $REMOTE_DIR/runs/stage-e-*sweep.log 2>/dev/null | head -1)"
         ;;
     *)
         echo "unknown subcommand: $cmd" >&2

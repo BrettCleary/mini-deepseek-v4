@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 # Runs on a fresh Lambda Cloud instance (Ubuntu 22.04 + CUDA image).
-# Installs deps, smoke-tests, kicks off Stage E v3 sweep.
+# Installs deps, smoke-tests, kicks off the named sweep.
 #
 # Usage on the remote box:
 #   cd ~/mini-deepseek-v4
-#   ./lambda_bootstrap.sh
+#   ./lambda_bootstrap.sh                       # default: run_stage_e_v3.sh
+#   ./lambda_bootstrap.sh run_stage_e_v3_1.sh   # any sweep script in this dir
 #
 # After this returns, the sweep is running nohup'd. tail -f sweep.log to watch.
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
+
+SWEEP_SCRIPT="${1:-run_stage_e_v3.sh}"
+SWEEP_LOG="runs/$(basename "$SWEEP_SCRIPT" .sh).log"
+
+if [ ! -x "$SWEEP_SCRIPT" ]; then
+    echo "error: sweep script $SWEEP_SCRIPT not found or not executable" >&2
+    exit 2
+fi
 
 echo "=== nvidia-smi ==="
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
@@ -44,11 +53,11 @@ tail -1 runs/smoke-bootstrap/log.jsonl | python3 -m json.tool
 rm -rf runs/smoke-bootstrap
 
 echo
-echo "=== launching real sweep in background ==="
-nohup ./run_stage_e_v3.sh > runs/stage-e-v3-sweep.log 2>&1 &
+echo "=== launching $SWEEP_SCRIPT in background ==="
+nohup "./$SWEEP_SCRIPT" > "$SWEEP_LOG" 2>&1 &
 echo "sweep pid: $!"
-echo "watch with: tail -f runs/stage-e-v3-sweep.log"
+echo "watch with: tail -f $SWEEP_LOG"
 sleep 3
 echo
 echo "=== first 10 lines of sweep log ==="
-head -10 runs/stage-e-v3-sweep.log || echo "(log not flushed yet)"
+head -10 "$SWEEP_LOG" || echo "(log not flushed yet)"
