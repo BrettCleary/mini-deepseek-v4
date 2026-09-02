@@ -48,7 +48,13 @@ def main() -> None:
     split = getattr(ds, args.split)
     L = mcfg.block_size
 
-    starts = list(range(0, split.numel() - L - 1, L))
+    doc_starts = ds.starts_for(args.split)
+    if doc_starts is not None:
+        # Restart the sweep at every document: a window spanning two documents
+        # would put unrelated text in the "context" whose value we are measuring.
+        starts = data.DocumentSampler(doc_starts, split.numel(), L).eval_windows(L)
+    else:
+        starts = list(range(0, split.numel() - L - 1, L))
     if args.max_windows:
         starts = starts[: args.max_windows]
 

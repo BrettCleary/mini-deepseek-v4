@@ -140,6 +140,27 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     raise ValueError(f"unknown lr_schedule: {cfg.lr_schedule!r}")
 
 
+def build_samplers(ds, block_size: int) -> dict[str, data.DocumentSampler | None]:
+    """One DocumentSampler per split, for corpora with real document
+    boundaries. Without these, windows straddle documents and part of every
+    long context is unrelated text."""
+    out: dict[str, data.DocumentSampler | None] = {}
+    for name in ("train", "val", "test"):
+        split = getattr(ds, name, None)
+        starts = ds.starts_for(name)
+        if split is None or starts is None:
+            out[name] = None
+            continue
+        try:
+            out[name] = data.DocumentSampler(starts, split.numel(), block_size)
+        except ValueError as e:
+            raise SystemExit(
+                f"[data] {name}: {e}. Lower --block-size or pick a corpus with "
+                f"longer documents."
+            ) from e
+    return out
+
+
 def masked_prefix(cfg: TrainConfig) -> int:
     """Positions excluded from the loss (design decision D2).
 
@@ -195,6 +216,7 @@ def evaluate(
     ds: data.CharDataset,
     cfg: TrainConfig,
     device: torch.device,
+    samplers: dict[str, data.DocumentSampler | None] | None = None,
 ) -> dict[str, float]:
     m.eval()
     # Mask first csa_m positions for csa eval (those positions have no
@@ -211,11 +233,14 @@ def evaluate(
     amp_ctx = _amp_ctx(cfg, device)
     out: dict[str, float] = {}
     for split_name, split_data in (("train", ds.train), ("val", ds.val)):
+        sampler = (samplers or {}).get(split_name)
         dense_losses = torch.zeros(cfg.eval_iters)
         topk_losses = torch.zeros(cfg.eval_iters) if is_csa else None
         indexer_losses = torch.zeros(cfg.eval_iters) if is_csa else None
         for i in range(cfg.eval_iters):
-            x, y = data.get_batch(split_data, cfg.block_size, cfg.batch_size, device)
+            x, y = data.get_batch(
+                split_data, cfg.block_size, cfg.batch_size, device, sampler=sampler
+            )
             with amp_ctx:
                 if is_csa:
                     _set_csa_topk(m, False)
@@ -252,6 +277,7 @@ def evaluate_split_full(
     split_data: torch.Tensor,
     cfg: TrainConfig,
     device: torch.device,
+    sampler: data.DocumentSampler | None = None,
 ) -> dict[str, float]:
     """Deterministic full sweep over non-overlapping `block_size`-length windows
     of `split_data`. Used for the canonical end-of-run numbers on val and test.
@@ -272,7 +298,12 @@ def evaluate_split_full(
 
     n = split_data.numel()
     # Each window needs L+1 tokens (x = [i:i+L], y = [i+1:i+L+1]).
-    starts = list(range(0, n - L - 1, L))  # non-overlapping; drops last partial
+    if sampler is not None:
+        # Restart the sweep at every document, so no evaluated window mixes two
+        # documents. Documents shorter than L are skipped entirely.
+        starts = sampler.eval_windows(L)
+    else:
+        starts = list(range(0, n - L - 1, L))  # non-overlapping; drops last partial
 
     total_loss_dense = 0.0
     total_loss_topk = 0.0
@@ -358,6 +389,14 @@ def train(cfg: TrainConfig) -> None:
         f"[data]  {cfg.dataset}  vocab={ds.vocab_size}, "
         f"train={len(ds.train):,} tokens, val={len(ds.val):,}{test_str}"
     )
+    samplers = build_samplers(ds, cfg.block_size)
+    if samplers["train"] is not None:
+        sp = samplers["train"]
+        print(
+            f"[data]  document-aware sampling: {len(sp.starts):,} train documents "
+            f"long enough for block_size={cfg.block_size} "
+            f"({sp.total_windows:,} distinct windows)"
+        )
 
     mcfg = model.ModelConfig(
         vocab_size=ds.vocab_size,
@@ -429,7 +468,7 @@ def train(cfg: TrainConfig) -> None:
     for step in range(cfg.max_iters + 1):
         # eval
         if step % cfg.eval_interval == 0:
-            metrics = evaluate(m, ds, cfg, device)
+            metrics = evaluate(m, ds, cfg, device, samplers)
             elapsed = time.time() - t0
             val_loss = metrics["val_loss"]
             if val_loss < best_val:
@@ -502,7 +541,10 @@ def train(cfg: TrainConfig) -> None:
         sum_indexer = 0.0
         n_indexer = 0
         for _micro in range(cfg.grad_accum_steps):
-            x, y = data.get_batch(ds.train, cfg.block_size, cfg.batch_size, device)
+            x, y = data.get_batch(
+                ds.train, cfg.block_size, cfg.batch_size, device,
+                sampler=samplers["train"],
+            )
             with amp_ctx:
                 _, lm_loss, indexer_loss = m(x, y, loss_mask=train_loss_mask)
                 # V3.2 two-phase schedule:
@@ -595,7 +637,7 @@ def train(cfg: TrainConfig) -> None:
         split_data = getattr(ds, split_name, None)
         if split_data is None:
             continue
-        metrics = evaluate_split_full(m, split_data, cfg, device)
+        metrics = evaluate_split_full(m, split_data, cfg, device, samplers.get(split_name))
         for k, v in metrics.items():
             final_entry[f"{split_name}_{k}"] = v
         line = (

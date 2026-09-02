@@ -182,6 +182,35 @@ cap long-range use on their own. The honest statement is that *at this scale,
 with these positional embeddings*, context beyond ~2K contributes almost
 nothing — not that enwik8 lacks long-range structure.
 
+### PG-19, and the gate that has to come first
+
+`--dataset pg19` adds Project Gutenberg books (Rae et al. 2019), the standard
+long-range LM benchmark, at the same 90M / 5M / 5M byte-level split sizes as
+enwiki8 so bpc is directly comparable. Books are fetched per-title from the
+public `deepmind-gutenberg` GCS bucket (no `datasets` dependency), taking a
+seeded *random* subset rather than the lowest Gutenberg ids — those correlate
+with age and canon status, and the first book by id is the 4.4MB King James
+Bible.
+
+The structural argument for it is solid: PG-19 books median ~400KB, so a
+window stays inside one book even at 64K. Windows are now document-aware
+everywhere (`data.DocumentSampler`) — training batches, periodic eval, and the
+full-split sweeps all restart at document boundaries, and documents shorter
+than `block_size` are skipped. On enwiki8 that mattered for 41% of bytes at
+16K context.
+
+The argument *against* it is unresolved: PG-19's long-range signal is largely
+semantic (plot, characters, style), and a ~10M-parameter byte-level model
+mostly cannot use that. Code would offer more mechanically exploitable
+long-range structure — repeated identifiers, imports, call sites — which is
+what induction heads actually learn.
+
+**So PG-19 is not yet justified, and no sweep should be run on it until it
+passes the gate:** train one vanilla model at long context and check
+`position_bpc.py` shows bpc still falling well past 2K. That is one cheap run,
+and it is the control that Stage E never had. If the curve is flat again, the
+dataset is not the fix and code is the next candidate.
+
 ### What CSA is actually claiming
 
 Worth stating plainly, because it sets the target. DeepSeek-V4 introduces CSA
@@ -303,7 +332,7 @@ dataclass. The ones that matter:
 | Flag | Default | What |
 | ---- | ------- | ---- |
 | `--attention` | `vanilla` | `vanilla` or `csa` |
-| `--dataset` | `tinyshakespeare` | `tinyshakespeare` or `enwiki8` |
+| `--dataset` | `tinyshakespeare` | `tinyshakespeare`, `enwiki8`, or `pg19` |
 | `--block-size` | 1024 | training sequence length |
 | `--batch-size` | 32 | micro-batch |
 | `--grad-accum-steps` | 1 | micro-batches per optimizer step |
