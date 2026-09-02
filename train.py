@@ -44,6 +44,10 @@ class TrainConfig:
     csa_n_h_i: int = 0      # 0 -> max(2, n_heads // 2)
     csa_d_c: int = 0        # 0 -> d_model // 2
     csa_top_k: int = 16     # eval-time top-k blocks per query
+    # Query-axis chunk for CSA core attention. 0 = one shot. Pure memory
+    # knob: results are unchanged, peak transient memory scales with the
+    # chunk instead of block_size. Needed at 16K.
+    csa_chunk: int = 0
 
     # V3.2-style two-phase training (CSA only)
     indexer_warmup_iters: int = 0  # phase 1 (indexer-only). 0 disables warmup.
@@ -56,6 +60,18 @@ class TrainConfig:
     lr: float = 3e-4
     min_lr: float = 3e-5
     warmup_iters: int = 100
+    # LR schedule shape. "cosine" anneals lr -> min_lr over `lr_horizon`;
+    # "wsd" holds `lr` flat then decays linearly to `min_lr` over the last
+    # `wsd_decay_frac` of `lr_horizon`.
+    lr_schedule: str = "cosine"
+    # Horizon the LR anneal is measured against. 0 -> fall back to max_iters
+    # (the pre-v4 behaviour). Set this explicitly to decouple the anneal from
+    # the stopping cap: with early stopping, a run that halts before max_iters
+    # never finishes its anneal, so two runs with different caps get different
+    # effective schedules even at the same best step. See README "Why: the LR
+    # schedule is tied to the iteration cap".
+    lr_horizon: int = 0
+    wsd_decay_frac: float = 0.2
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     grad_accum_steps: int = 1   # accumulate gradients over this many micro-batches per opt step
@@ -92,13 +108,31 @@ def parse_args() -> TrainConfig:
 # ---------------------------------------------------------------------------
 
 
+def lr_horizon_of(cfg: TrainConfig) -> int:
+    """Steps the LR anneal is stretched over. Deliberately separate from
+    `max_iters`, which is only the stopping backstop."""
+    return cfg.lr_horizon if cfg.lr_horizon > 0 else cfg.max_iters
+
+
 def lr_at(step: int, cfg: TrainConfig) -> float:
-    """Cosine schedule with linear warmup."""
+    """Linear warmup, then cosine or WSD decay over `lr_horizon_of(cfg)`."""
     if step < cfg.warmup_iters:
         return cfg.lr * (step + 1) / cfg.warmup_iters
-    progress = (step - cfg.warmup_iters) / max(1, cfg.max_iters - cfg.warmup_iters)
+
+    horizon = lr_horizon_of(cfg)
+    progress = (step - cfg.warmup_iters) / max(1, horizon - cfg.warmup_iters)
     progress = min(max(progress, 0.0), 1.0)
-    return cfg.min_lr + 0.5 * (cfg.lr - cfg.min_lr) * (1.0 + math.cos(math.pi * progress))
+
+    if cfg.lr_schedule == "cosine":
+        return cfg.min_lr + 0.5 * (cfg.lr - cfg.min_lr) * (1.0 + math.cos(math.pi * progress))
+    if cfg.lr_schedule == "wsd":
+        # Flat at `lr` through the stable phase, then linear to `min_lr`.
+        stable = 1.0 - cfg.wsd_decay_frac
+        if progress <= stable:
+            return cfg.lr
+        decay = (progress - stable) / max(1e-9, cfg.wsd_decay_frac)
+        return cfg.lr + (cfg.min_lr - cfg.lr) * decay
+    raise ValueError(f"unknown lr_schedule: {cfg.lr_schedule!r}")
 
 
 def make_loss_mask(
@@ -319,6 +353,7 @@ def train(cfg: TrainConfig) -> None:
         csa_n_h_i=cfg.csa_n_h_i if cfg.csa_n_h_i > 0 else None,
         csa_d_c=cfg.csa_d_c if cfg.csa_d_c > 0 else None,
         csa_top_k=cfg.csa_top_k,
+        csa_chunk=cfg.csa_chunk,
     )
     m = model.MiniTransformer(mcfg).to(device)
     if cfg.compile:
@@ -348,6 +383,18 @@ def train(cfg: TrainConfig) -> None:
         f"[opt]   amp={cfg.amp}, grad_accum_steps={cfg.grad_accum_steps}, "
         f"effective_batch={cfg.batch_size * cfg.grad_accum_steps}"
     )
+    horizon = lr_horizon_of(cfg)
+    print(
+        f"[lr]    {cfg.lr_schedule}, warmup={cfg.warmup_iters}, horizon={horizon}"
+        f"{' (= max_iters)' if cfg.lr_horizon <= 0 else ''}, "
+        f"{cfg.lr:.2e} -> {cfg.min_lr:.2e}"
+    )
+    if cfg.lr_horizon <= 0 and cfg.early_stop_patience > 0:
+        print(
+            "[lr]    WARNING: early stopping is on and lr_horizon is unset, so the "
+            "anneal is tied to max_iters and a run that stops early never completes "
+            "it. Cells with different caps are not comparable. Pass --lr-horizon."
+        )
 
     m.train()
     t0 = time.time()
