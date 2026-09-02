@@ -214,6 +214,52 @@ Standard `W^O ∈ R^{c·n_h × d}` linear. Grouped variant is a FLOPs optimizati
 
 Solves a different problem (long-context stability) than what we're testing.
 
+### D7 — Sliding-window branch → **ADDED 2026-09-02, REVERSING D6's SCOPE**
+
+Paper §2.3.3 ("Additional Branch of Sliding Window Attention") states the
+motivation explicitly:
+
+> "In order to strictly preserve causality in CSA and HCA, each query attends to
+> only preceding compressed KV blocks. **Consequently, a query cannot access
+> information from other tokens within its own compressed block.** ... For these
+> reasons, we introduce a supplementary attention branch."
+
+This is not an optional extra. Figure 3 — the CSA architecture diagram in
+§2.3.1 — shows "Sliding Window KV Entries" concatenated with "Selected
+Compressed KV Entries" before Shared-KV MQA. Equations 9–19 render only the
+compressed branch, so an implementation built faithfully from the equations
+omits a component that the figure on the same page includes. A gradient probe
+confirmed the resulting blind spot: for m=4, `logits[23]` has exactly zero
+dependence on input positions 20, 21, 22, at any depth.
+
+Implemented as `--csa-n-win` (0 = off, preserving the previous model exactly).
+DeepSeek-V4 uses `n_win = 128` for both Flash and Pro at m=4 (§4.2.1).
+
+**Design choices where the paper is ambiguous:**
+
+1. *Where the window entries come from.* Figure 3 routes them from the KV
+   hidden states directly, bypassing the token-level compressor, so we use a
+   separate `W_win ∈ R^{d×c}` rather than reusing `C^a` (which would be the
+   zero-parameter alternative and is also a defensible reading). Costs
+   `d·c` = 24.6K params per layer.
+2. *Normalization.* §2.3.3 specifies RMSNorm on the compressed KV entries; the
+   window entries get their own RMSNorm, since sharing `k_norm` across two
+   differently-distributed tensors is unmotivated.
+3. *Single softmax, not two attentions.* Figure 3's Concatenation node feeds one
+   Shared-KV MQA, so window and compressed scores are concatenated before a
+   single softmax. The model apportions attention mass between local and
+   compressed context rather than summing two independent attention outputs.
+4. *Top-k applies to the compressed branch only.* The indexer scores blocks; the
+   window is always present. This matches Figure 3, where the Top-k Selector
+   sits only on the compressed path.
+5. *The V3.2 KL teacher is renormalized over blocks only*, since the indexer
+   predicts blocks and not window tokens.
+
+**Consequence for D2:** with the window on, positions `t < m` have real
+attention output, so they are no longer masked from the loss. This also removes
+a small arm-to-arm asymmetry — CSA previously scored on `m` fewer positions than
+vanilla.
+
 ---
 
 ## Future work (paper-faithful trajectory, explicitly out of v1)

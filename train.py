@@ -44,6 +44,11 @@ class TrainConfig:
     csa_n_h_i: int = 0      # 0 -> max(2, n_heads // 2)
     csa_d_c: int = 0        # 0 -> d_model // 2
     csa_top_k: int = 16     # eval-time top-k blocks per query
+    # Sliding-window branch (paper 2.3.3 / Fig 3): each query also attends to
+    # the csa_n_win most recent uncompressed tokens. 0 disables it. DeepSeek-V4
+    # uses 128 at m=4 (4.2.1). Without it a query cannot see any token inside
+    # its own compressed block, which costs ~0.5 bpc at byte level.
+    csa_n_win: int = 0
     # Query-axis chunk for CSA core attention. 0 = one shot. Pure memory
     # knob: results are unchanged, peak transient memory scales with the
     # chunk instead of block_size. Needed at 16K.
@@ -135,6 +140,20 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     raise ValueError(f"unknown lr_schedule: {cfg.lr_schedule!r}")
 
 
+def masked_prefix(cfg: TrainConfig) -> int:
+    """Positions excluded from the loss (design decision D2).
+
+    A CSA query at t < m has no causally-valid compressed block, so it gets no
+    gradient and must be excluded. The sliding-window branch gives those
+    positions real attention output, so with csa_n_win > 0 nothing needs
+    masking — which also makes CSA score on exactly the same positions as
+    vanilla, removing a small arm-to-arm asymmetry.
+    """
+    if cfg.attention != "csa" or cfg.csa_n_win > 0:
+        return 0
+    return cfg.csa_m
+
+
 def make_loss_mask(
     batch_size: int, block_size: int, mask_first: int, device: torch.device
 ) -> torch.Tensor | None:
@@ -182,7 +201,7 @@ def evaluate(
     # learning signal — see D2). For vanilla, no mask: every position is
     # valid. The 0.4% gap (4/1024) between vanilla "all positions" and csa
     # "excluding first m" is documented in the README as negligible.
-    mask_first = cfg.csa_m if cfg.attention == "csa" else 0
+    mask_first = masked_prefix(cfg)
     loss_mask = make_loss_mask(cfg.batch_size, cfg.block_size, mask_first, device)
 
     # For CSA, run two eval passes per D3: dense (no top-k) and top-k.
@@ -246,7 +265,7 @@ def evaluate_split_full(
     """
     m.eval()
     is_csa = cfg.attention == "csa"
-    mask_first = cfg.csa_m if is_csa else 0
+    mask_first = masked_prefix(cfg)
     B = cfg.batch_size
     L = cfg.block_size
     amp_ctx = _amp_ctx(cfg, device)
@@ -354,6 +373,7 @@ def train(cfg: TrainConfig) -> None:
         csa_d_c=cfg.csa_d_c if cfg.csa_d_c > 0 else None,
         csa_top_k=cfg.csa_top_k,
         csa_chunk=cfg.csa_chunk,
+        csa_n_win=cfg.csa_n_win,
     )
     m = model.MiniTransformer(mcfg).to(device)
     if cfg.compile:
@@ -375,7 +395,7 @@ def train(cfg: TrainConfig) -> None:
     log_f = log_path.open("w")
     print(f"[run]   logging to {run_dir}")
 
-    train_mask_first = cfg.csa_m if cfg.attention == "csa" else 0
+    train_mask_first = masked_prefix(cfg)
     train_loss_mask = make_loss_mask(cfg.batch_size, cfg.block_size, train_mask_first, device)
 
     amp_ctx = _amp_ctx(cfg, device)

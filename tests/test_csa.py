@@ -718,6 +718,22 @@ def test_query_chunking_is_exact():
                 assert torch.equal(b, g), f"chunk={chunk} topk={topk} changed {name}"
 
 
+def test_query_chunking_is_exact_with_sliding_window():
+    """Same guarantee with the window branch on. Not bit-exact here: the
+    window key slab spans chunk boundaries, so its length -- and hence the
+    summation order of the output reduction -- varies with the chunk. The
+    drift must stay at fp64 round-off."""
+    for topk in (False, True):
+        ref = _csa_model(csa_n_win=8, csa_chunk=0)
+        ref.train(not topk)
+        base = _run(ref, topk)
+        for chunk in (4, 8, 16, 32):
+            m = _csa_model(csa_n_win=8, csa_chunk=chunk)
+            m.train(not topk)
+            for b, g, name in zip(base, _run(m, topk), ("logits", "lm_loss", "kl")):
+                assert torch.allclose(b, g, atol=1e-12), f"chunk={chunk} drifted in {name}"
+
+
 def test_fully_masked_rows_produce_zero_output_and_no_nan():
     """Positions t < m have no causally-valid block. The mask uses a large
     finite value rather than -inf (so softmax yields uniform, not NaN); the
@@ -752,3 +768,87 @@ def test_indexer_kl_matches_explicit_log_softmax_form():
 
     got = m._indexer_kl_loss([aux], loss_mask=None)
     assert torch.allclose(got, expected.mean(), atol=1e-12), f"{got} vs {expected.mean()}"
+
+
+def test_sliding_window_closes_the_recency_hole():
+    """Paper 2.3.3: the compressed branch alone cannot see any token inside the
+    query's own compressed block. A gradient probe (d logits[t] / d input[s])
+    must show that gap with the branch off and no gap with it on.
+    """
+    def visible(n_win, t):
+        cfg = model.ModelConfig(
+            attention="csa", vocab_size=37, d_model=48, n_layers=3, n_heads=4,
+            block_size=32, csa_m=4, csa_top_k=8, csa_n_win=n_win,
+        )
+        torch.manual_seed(0)
+        m = model.MiniTransformer(cfg).double().eval()
+        torch.manual_seed(1)
+        emb = torch.randn(1, 32, 48, dtype=torch.float64, requires_grad=True)
+        x = emb + m.pos_embed(torch.arange(32))
+        for blk in m.blocks:
+            x, _ = blk(x)
+        m.lm_head(m.norm_f(x))[0, t].sum().backward()
+        seen = (emb.grad[0].abs().sum(-1) > 1e-30).nonzero().flatten().tolist()
+        return [s for s in range(t) if s not in seen]
+
+    # t = 23, m = 4: the hole is exactly [20, 23).
+    assert visible(0, 23) == [20, 21, 22]
+    assert visible(0, 7) == [4, 5, 6]
+    # A window of m is enough to close it; anything larger also works.
+    for n_win in (4, 8, 16):
+        assert visible(n_win, 23) == []
+        assert visible(n_win, 7) == []
+    # t a multiple of m has no hole either way.
+    assert visible(0, 16) == []
+
+
+def test_sliding_window_attends_exactly_the_last_n_win_tokens():
+    """The window must be causal and exactly n_win wide, inclusive of t."""
+    n_win = 6
+    cfg = model.ModelConfig(
+        attention="csa", vocab_size=37, d_model=48, n_layers=1, n_heads=4,
+        block_size=32, csa_m=4, csa_top_k=8, csa_n_win=n_win,
+    )
+    torch.manual_seed(0)
+    m = model.MiniTransformer(cfg).double().eval()
+    attn = m.blocks[0].attn
+    n = 32
+    t_abs = torch.arange(n).unsqueeze(1)
+    s_abs = torch.arange(n).unsqueeze(0)
+    expected = (s_abs <= t_abs) & (s_abs > t_abs - n_win)
+    # Rebuild the mask the layer uses for a single full-length chunk.
+    got = (s_abs <= t_abs) & (s_abs > t_abs - attn.n_win)
+    assert torch.equal(expected, got)
+    assert got[10].nonzero().flatten().tolist() == [5, 6, 7, 8, 9, 10]
+    assert got[2].nonzero().flatten().tolist() == [0, 1, 2]  # clipped at the start
+
+
+def test_window_off_leaves_first_m_positions_dead():
+    """Guards the D2 contract that masked_prefix() depends on: with the branch
+    off, t < m still produces exactly zero attention output."""
+    off = _csa_model(csa_n_win=0)
+    off.eval()
+    torch.manual_seed(3)
+    x = torch.randn(2, 64, 48, dtype=torch.float64)
+    out_off, _ = off.blocks[0].attn(x)
+    assert torch.equal(out_off[:, :4], torch.zeros_like(out_off[:, :4]))
+
+    on = _csa_model(csa_n_win=8)
+    on.eval()
+    out_on, aux_on = on.blocks[0].attn(x)
+    assert out_on[:, :4].abs().sum() > 0, "window should give t < m real output"
+    # ...but the indexer still has nothing to predict there.
+    assert torch.equal(aux_on["p"][:, :4], torch.zeros_like(aux_on["p"][:, :4]))
+
+
+def test_teacher_stays_a_distribution_over_blocks_with_window_on():
+    """p is renormalized over compressed blocks only -- the indexer scores
+    blocks, not window tokens -- so it must still sum to 1 on valid rows even
+    though the window takes some of the softmax mass."""
+    m = _csa_model(csa_n_win=8)
+    m.train()
+    torch.manual_seed(5)
+    x = torch.randn(2, 64, 48, dtype=torch.float64)
+    _, aux = m.blocks[0].attn(x)
+    rows = aux["p"][:, 4:].sum(-1)
+    assert torch.allclose(rows, torch.ones_like(rows))

@@ -105,6 +105,53 @@ That vanilla number exposes a third problem: **16K (1.570) scores better than 8K
 are undertrained, which means the true 8K gap is *wider* than any number in the
 tables above.
 
+### The bigger problem: the CSA arm has a recency hole
+
+Paper §2.3.3 is explicit that the compressed branch alone leaves a blind spot:
+
+> "In order to strictly preserve causality in CSA and HCA, each query attends to
+> only preceding compressed KV blocks. **Consequently, a query cannot access
+> information from other tokens within its own compressed block.** ... For these
+> reasons, we introduce a supplementary attention branch [in] a sliding window
+> manner."
+
+Figure 3 — the CSA architecture diagram — shows those sliding-window entries
+concatenated with the selected compressed entries before Shared-KV MQA.
+Equations 9–19 render only the compressed branch, so this implementation, built
+faithfully from the equations, omitted it. A gradient probe confirms the gap:
+at `m=4`, `logits[23]` has *exactly zero* dependence on input positions 20, 21,
+22, at any depth. Every query is missing the `t mod m` bytes immediately before
+it — ~1.5 bytes on average, and at byte level those are the most informative
+ones. An order-K n-gram proxy prices the loss at **~+0.52 bpc**, comparable to
+the entire gap the tables above report.
+
+Implemented as `--csa-n-win` (§2.3.3; DeepSeek-V4 uses `n_win = 128` at `m = 4`,
+§4.2.1). See notes.md D7 for the design choices where the paper is ambiguous.
+
+**The two known confounds push in opposite directions**, which is why the
+tables above cannot be corrected by inspection:
+
+| confound | flatters | reported gap is therefore |
+| --- | --- | --- |
+| LR anneal tied to the cap (CSA got 51-93% of its schedule, vanilla 20-31%) | CSA | too **narrow** |
+| recency hole (~0.5 bpc) | vanilla | too **wide** |
+
+### What CSA is actually claiming
+
+Worth stating plainly, because it sets the target. DeepSeek-V4 introduces CSA
+"to enhance long-context **efficiency**" — the claim is cost, not quality. Their
+own recipe (§4.2.2) makes this concrete: they **warm up with dense attention for
+the first 1T tokens** and **introduce sparse attention only at 64K sequence
+length**, having trained at 4K and 16K densely first.
+
+So at matched parameters, matched tokens and matched context, dense attention is
+close to an upper bound — CSA compresses `m` tokens into one entry and then
+discards all but the top-k of those, and both steps are lossy. Expecting CSA to
+*beat* dense in bpc under those constraints is expecting a lossy approximation
+to beat what it approximates. The honest target is **parity**, and the honest
+axis is quality per unit of compute or KV cache, neither of which this repo
+currently measures.
+
 ### What this repo currently supports
 
 - CSA at 4× compression is **consistently and substantially worse** than dense
@@ -219,6 +266,7 @@ dataclass. The ones that matter:
 | `--lr-horizon` | 0 | steps the LR anneal spans; 0 falls back to `--max-iters`. **Set this whenever early stopping is on** — see Results |
 | `--lr-schedule` | `cosine` | `cosine` or `wsd` (flat, then linear decay over the last `--wsd-decay-frac`) |
 | `--csa-chunk` | 0 | query-axis chunk for CSA attention; 0 = one shot. Memory only, results identical |
+| `--csa-n-win` | 0 | sliding-window branch width (paper §2.3.3); 0 = off. DeepSeek-V4 uses 128 |
 | `--early-stop-patience` | 0 | evals without val improvement before stopping; 0 disables |
 | `--lr` / `--min-lr` | 3e-4 / 3e-5 | cosine endpoints |
 | `--csa-m` | 4 | compression factor (m KV tokens → 1 compressed entry) |

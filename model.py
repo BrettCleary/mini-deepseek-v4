@@ -46,6 +46,14 @@ class ModelConfig:
     csa_n_h_i: int | None = None  # indexer query heads. Defaults to max(2, n_heads // 2).
     csa_d_c: int | None = None    # shared query latent dim. Defaults to d_model // 2.
     csa_top_k: int = 16           # eval-time top-k blocks per query (D3).
+    # Paper §2.3.3 "Additional Branch of Sliding Window Attention": each query
+    # additionally attends to the `csa_n_win` most recent *uncompressed* tokens,
+    # concatenated with the selected compressed entries before a single core
+    # attention (Figure 3). Without it a query cannot see any token inside its
+    # own compressed block — the paper's stated reason for the branch. 0
+    # disables it and reproduces the compressed-branch-only model. DeepSeek-V4
+    # uses 128 for both Flash and Pro (§4.2.1), at m = 4.
+    csa_n_win: int = 0
     # Query-axis chunk for core attention. 0 = one shot (all n queries).
     # The score matrix is (b, n_heads, n, n_blk) and autocast runs softmax in
     # fp32, so at n=16384/m=4 one layer's scores are 1.6GB; chunking bounds the
@@ -295,6 +303,14 @@ class CSAAttention(nn.Module):
         self.m = cfg.csa_m
         self.top_k = cfg.csa_top_k
         self.chunk_size = cfg.csa_chunk
+        self.n_win = cfg.csa_n_win
+        if self.n_win > 0:
+            # Figure 3 routes the sliding-window entries straight from the KV
+            # hidden states, bypassing the token-level compressor, so this is a
+            # projection of its own rather than a reuse of C^a. The paper does
+            # not specify it explicitly — see notes.md, D7.
+            self.W_win = nn.Linear(cfg.d_model, cfg.csa_c, bias=False)
+            self.win_norm = RMSNorm(cfg.csa_c)
         # Toggle for the eval-time top-k filter. Set False to evaluate
         # densely (no top-k), used by the training loop's dual eval to
         # report the train/eval mismatch metric (D3).
@@ -328,6 +344,10 @@ class CSAAttention(nn.Module):
         kv = self.compress(x)        # (b, n_blk, c)
         kv = self.k_norm(kv)
 
+        # Uncompressed per-token KV entries for the sliding-window branch.
+        # Shared across heads like the compressed entries (MQA).
+        win = self.win_norm(self.W_win(x)) if self.n_win > 0 else None   # (b, n, c)
+
         # Causal mask: token index t may attend to blocks s < t // m.
         device = x.device
         token_idx = torch.arange(n, device=device).unsqueeze(1)             # (n, 1)
@@ -349,6 +369,9 @@ class CSAAttention(nn.Module):
         ps: list[torch.Tensor] = []
         for lo in range(0, n, chunk):
             hi = min(lo + chunk, n)
+            # Keys this chunk's sliding windows can reach: the earliest query
+            # in the chunk looks back n_win - 1 positions.
+            w_lo = max(0, lo - self.n_win + 1) if self.n_win > 0 else 0
             out_c, p_c = self._attend(
                 q[:, lo:hi],
                 kv,
@@ -356,6 +379,9 @@ class CSAAttention(nn.Module):
                 indexer_scores[:, lo:hi],
                 row_valid[lo:hi],
                 apply_topk,
+                win[:, w_lo:hi] if win is not None else None,
+                lo,
+                w_lo,
             )
             outs.append(out_c)
             ps.append(p_c)
@@ -375,13 +401,19 @@ class CSAAttention(nn.Module):
         kv: torch.Tensor,
         causal: torch.Tensor,
         indexer_scores: torch.Tensor,
-        row_valid: torch.Tensor,
+        blk_valid: torch.Tensor,
         apply_topk: bool,
+        win: torch.Tensor | None = None,
+        lo: int = 0,
+        w_lo: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Core attention for one chunk of query positions.
 
         Shapes: q (b, n_c, h, c), kv (b, n_blk, c), causal (n_c, n_blk),
-        indexer_scores (b, n_c, n_blk), row_valid (n_c,).
+        indexer_scores (b, n_c, n_blk), blk_valid (n_c,) marking queries with at
+        least one causally-valid compressed block. `win` is the slice of
+        uncompressed sliding-window entries this chunk can reach, covering
+        absolute positions [w_lo, lo + n_c); None disables the branch.
         Returns (out (b, n_c, h*c), p (b, n_c, n_blk) detached).
         """
         # Core attention logits. Indexer scores no longer feed back as an
@@ -401,26 +433,51 @@ class CSAAttention(nn.Module):
             keep.scatter_(-1, topk_idx, True)                                # (b, n_c, n_blk)
             scores = scores.masked_fill(~keep.unsqueeze(1), _MASK_FILL)
 
+        # Sliding-window branch (paper §2.3.3 / Figure 3). The window entries
+        # are concatenated with the selected compressed entries and share a
+        # SINGLE core attention, so the model apportions attention mass between
+        # local and compressed context rather than summing two attentions.
+        n_blk = kv.shape[1]
+        any_valid = blk_valid
+        if win is not None:
+            n_c = q.shape[1]
+            t_abs = torch.arange(lo, lo + n_c, device=q.device).unsqueeze(1)
+            s_abs = torch.arange(w_lo, lo + n_c, device=q.device).unsqueeze(0)
+            # Causal and within the last n_win tokens, inclusive of t itself.
+            win_ok = (s_abs <= t_abs) & (s_abs > t_abs - self.n_win)
+            scores_win = einsum(q, win, "b n h c, b s c -> b h n s") / math.sqrt(self.c)
+            scores_win = scores_win.masked_fill(~win_ok, _MASK_FILL)
+            scores = torch.cat([scores, scores_win], dim=-1)
+            # Every position has at least itself in the window, so no row is
+            # fully masked once the branch is on.
+            any_valid = blk_valid | win_ok.any(dim=-1)
+
         attn = F.softmax(scores, dim=-1)
+        attn_blk = attn[..., :n_blk]
 
         # V3.2 eq. 3: teacher target p_{t,:} = L1-normalize_seq(sum_h attn).
         # Detached so L_I doesn't push gradient back into the attention path
         # (we want the indexer to chase attention, not the other way around).
-        p = attn.sum(dim=1)                                                  # (b, n_c, n_blk)
+        # Only the compressed-block share is used: the indexer scores blocks,
+        # not window tokens, so renormalizing over blocks keeps p a
+        # distribution over exactly what the indexer has to predict.
+        p = attn_blk.sum(dim=1)                                              # (b, n_c, n_blk)
         p_sum = p.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         p = (p / p_sum).detach()
 
-        out = einsum(attn, kv, "b h n s, b s c -> b h n c")
+        out = einsum(attn_blk, kv, "b h n s, b s c -> b h n c")
+        if win is not None:
+            out = out + einsum(attn[..., n_blk:], win, "b h n s, b s c -> b h n c")
         out = rearrange(out, "b h n c -> b n (h c)")
 
-        # Fully-masked rows (t < m) softmaxed to uniform over invalid blocks.
-        # Force their output and their teacher row to zero, matching the
-        # "no causally-valid block => no attention output" contract. Done on
-        # `out` (b, n_c, h*c) rather than on `attn` (b, h, n_c, n_blk) because
-        # `out` is smaller by a factor of n_blk / c.
-        gate = row_valid.view(1, -1, 1)
-        out = out * gate.to(out.dtype)
-        p.masked_fill_(~gate, 0.0)                                           # p is detached
+        # Rows with nothing to attend to softmaxed to uniform over an all-masked
+        # row; force their output to zero. Without the window branch that is
+        # every t < m; with it, no row at all.
+        out = out * any_valid.view(1, -1, 1).to(out.dtype)
+        # The teacher is zeroed wherever no *block* is valid, independently of
+        # the window: at t < m the indexer has nothing to predict even though
+        # the window now gives those positions real attention output.
+        p.masked_fill_(~blk_valid.view(1, -1, 1), 0.0)                       # p is detached
         return out, p
 
 
