@@ -54,6 +54,9 @@ run before `max_iters`. So **a run that early-stops never finishes its LR
 anneal**, and cells that stop at different fractions of their cap are not
 comparable.
 
+*(Fixed for future runs via `--lr-horizon`; see [What would fix it](#what-would-fix-it).
+Every number in the tables on this page predates that fix.)*
+
 The cleanest demonstration is a pair of runs already in this repo:
 
 | run | cap | best step | test bpc |
@@ -113,13 +116,54 @@ tables above.
 
 ### What would fix it
 
-1. Decouple the LR schedule from `max_iters` — either fix the cosine horizon per
-   context independently of the stopping cap, or switch to WSD with an explicit
-   decay phase triggered at stop. This is the blocking change.
-2. Re-run 8K and 16K for both arms under the fixed schedule.
-3. Chunk the CSA score matrix (or route it through SDPA) so `csa-16k` fits in
-   40GB. The estimate in `run_stage_e_v3_2.sh` assumed the scores were the only
-   large allocation; they were not.
+1. ~~Decouple the LR schedule from `max_iters`.~~ **Done.** `--lr-horizon` sets
+   the anneal length independently of the stopping cap, and `--lr-schedule wsd`
+   adds a flat-then-decay alternative. Unset, `--lr-horizon` reproduces the old
+   behaviour exactly, so the runs already in `runs/` stay reproducible; the
+   trainer now prints a warning when early stopping is on and no horizon is set.
+2. ~~Make `csa-16k` fit in 40GB.~~ **Partly done** — see below.
+3. **Re-run the sweep.** Not started, and it should be *one* sweep covering the
+   whole ladder rather than new 8K/16K cells spliced onto the old short-context
+   ones. The LR bias applied to every cell, not just the long ones (at 2K,
+   vanilla stopped at 20% of its cap and CSA at 57%), so mixing schedules across
+   contexts rebuilds the same splice this README already flags.
+
+Item 3 is now the only thing standing between this repo and a clean answer, and
+it is the expensive one: roughly 40-60 A100-hours at v3.1's measured rates
+(`csa-8k` alone took 8.5h).
+
+#### On the 16K memory work
+
+The `run_stage_e_v3_2.sh` estimate ("768MB/layer") was wrong on two counts. The
+score matrix is `(b, n_heads, n, n_blk)`, and **autocast runs `softmax` in fp32
+regardless of the bf16 input** — so at 16K one layer's attention probabilities
+are 1.5GB, not 768MB, and a bf16 copy is made on the way into the output
+matmul. Measured saved-for-backward totals at the true 16K shape:
+
+| | per layer | 6 layers, fwd+bwd |
+| --- | --- | --- |
+| before | 3.79 GiB | ~25.0 GiB |
+| after  | 3.73 GiB | ~22.9 GiB |
+
+Two exactly output-preserving changes (both covered by tests):
+
+- **`--csa-chunk`** splits core attention along the query axis, so the transient
+  mask/softmax copies scale with the chunk instead of `block_size`. This is
+  where most of the saving is: at 16K the forward transient drops from 2.21 GiB
+  to 0.36 GiB.
+- **The indexer KL no longer materializes `log_softmax(I)`.** Using
+  `KL = Σp·log p − Σp·I + logsumexp(I)·Σp` keeps only a `(b, n)` reduction
+  instead of a full `(b, n, n_blk)` fp32 tensor. This is also why attention
+  masks now use a large finite value instead of `-inf`: `p·I` at a masked block
+  must be `0`, not `0 · -inf = NaN`.
+
+**This is not yet confirmed to fix the OOM.** The projection above (~23 GiB) is
+well under the A100's 40GB, but the run that died reported 36.9GB *allocated*,
+and that gap is unexplained — it cannot be reproduced on the 16GB local card.
+Confirm with a short `csa-16k` smoke run before committing to a full sweep. The
+largest remaining lever, if it is still tight, is computing the core softmax in
+bf16 (~9GB at 16K), but that changes numerics mid-study and should be a last
+resort.
 
 ## Setup
 
@@ -171,7 +215,10 @@ dataclass. The ones that matter:
 | `--batch-size` | 32 | micro-batch |
 | `--grad-accum-steps` | 1 | micro-batches per optimizer step |
 | `--amp` | `none` | `none` or `bf16` (halves activation memory) |
-| `--max-iters` | 3000 | **also sets the cosine LR horizon** — see Results |
+| `--max-iters` | 3000 | stopping backstop |
+| `--lr-horizon` | 0 | steps the LR anneal spans; 0 falls back to `--max-iters`. **Set this whenever early stopping is on** — see Results |
+| `--lr-schedule` | `cosine` | `cosine` or `wsd` (flat, then linear decay over the last `--wsd-decay-frac`) |
+| `--csa-chunk` | 0 | query-axis chunk for CSA attention; 0 = one shot. Memory only, results identical |
 | `--early-stop-patience` | 0 | evals without val improvement before stopping; 0 disables |
 | `--lr` / `--min-lr` | 3e-4 / 3e-5 | cosine endpoints |
 | `--csa-m` | 4 | compression factor (m KV tokens → 1 compressed entry) |

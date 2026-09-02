@@ -22,6 +22,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Reduce CUDA memory fragmentation at long context. Worth keeping, but it is
+# NOT what makes csa-16k fit: the OOM traceback reports 36.93GB genuinely
+# allocated against only 950MB reserved-but-unallocated, so defragmentation
+# has under 1GB to recover against a 1.5GB shortfall. The real reduction is
+# --csa-chunk plus the log_softmax-free indexer KL (see README, "On the 16K
+# memory work"). No effect on correctness either way.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 CTX=16384
 BATCH=1
 ACCUM=32
