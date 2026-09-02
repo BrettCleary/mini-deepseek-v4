@@ -136,6 +136,52 @@ tables above cannot be corrected by inspection:
 | LR anneal tied to the cap (CSA got 51-93% of its schedule, vanilla 20-31%) | CSA | too **narrow** |
 | recency hole (~0.5 bpc) | vanilla | too **wide** |
 
+### The context axis is nearly inert on this dataset
+
+Before trusting any sweep *over context length*, it is worth asking whether
+context length does anything here at all. It mostly doesn't.
+
+`position_bpc.py` measures one trained model's test bpc bucketed by position
+within the eval window — position `t` has `t` tokens of context available, so
+the curve is the answer, and using a single model avoids every cross-cell
+confound (LR horizon, parameter count, positional-embedding budget).
+
+`stage-e-v3-2-vanilla-16k` is the right model to ask: it reached its best step
+at 9900 of a 10000 cap, so it essentially completed its anneal and is the one
+run the LR confound does not touch. Full test split, 305 windows:
+
+| positions (context available) | bpc |
+| --- | --- |
+| 0-1024 | 1.683 |
+| 1024-2048 | 1.561 |
+| 2048-3072 | 1.581 |
+| 4096-5120 | 1.580 |
+| 8192-9216 | 1.569 |
+| 12288-13312 | 1.549 |
+| 15360-16384 | 1.541 |
+
+One drop as the model acquires its first ~2K of context, then flat. **Going from
+4K to 16K of context is worth ~0.04 bpc**, against bucket-to-bucket noise of
+±0.02-0.04. At 1K the same measurement (`stage-e-v3-vanilla-1k`, 64-position
+buckets) shows most of the gain arriving in the first ~256 positions: 1.683 at
+0-64, 1.301 by 192-256, then broadly flat to 1.24 at 1024.
+
+**This is the finding that undercuts the Stage E design.** The sweep varies an
+independent variable worth ~0.04 bpc while trying to detect architecture
+differences of 0.13-1.07 bpc — the effect sought is an order of magnitude
+larger than the total headroom on the axis being varied. It also explains why
+vanilla bpc got *worse* with context in all three sweeps: longer context buys
+almost nothing while costing real capacity (16384 learned position embeddings,
+each receiving far fewer updates) and optimizer steps.
+
+Caveats, because this is a claim about a regime and not about enwik8 in
+general: these are ~10M-parameter models at 1.3-1.6 bpc, well short of tuned
+char-level models (~1.0), so capacity rather than data may be the binding
+constraint; and D4's learned absolute position embeddings (no RoPE) plausibly
+cap long-range use on their own. The honest statement is that *at this scale,
+with these positional embeddings*, context beyond ~2K contributes almost
+nothing — not that enwik8 lacks long-range structure.
+
 ### What CSA is actually claiming
 
 Worth stating plainly, because it sets the target. DeepSeek-V4 introduces CSA
