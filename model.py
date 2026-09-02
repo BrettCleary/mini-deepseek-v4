@@ -46,6 +46,11 @@ class ModelConfig:
     csa_n_h_i: int | None = None  # indexer query heads. Defaults to max(2, n_heads // 2).
     csa_d_c: int | None = None    # shared query latent dim. Defaults to d_model // 2.
     csa_top_k: int = 16           # eval-time top-k blocks per query (D3).
+    # Query-axis chunk for core attention. 0 = one shot (all n queries).
+    # The score matrix is (b, n_heads, n, n_blk) and autocast runs softmax in
+    # fp32, so at n=16384/m=4 one layer's scores are 1.6GB; chunking bounds the
+    # transient copies (mask + softmax) without changing the result.
+    csa_chunk: int = 0
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
@@ -99,6 +104,14 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w_down(self.w_gate(x) * F.silu(self.w_up(x)))
+
+
+# Finite stand-in for -inf in attention masks. Large enough that exp() of it
+# underflows to exactly 0 in fp64/fp32/bf16 (so masked entries carry no weight),
+# but finite, so a fully-masked row softmaxes to a uniform distribution instead
+# of NaN. Avoiding the NaN lets us drop the nan_to_num repair, which would
+# otherwise cost a second full-size copy of the score matrix.
+_MASK_FILL = -1e9
 
 
 class VanillaMultiHeadAttention(nn.Module):
@@ -281,6 +294,7 @@ class CSAAttention(nn.Module):
         self.c = cfg.csa_c
         self.m = cfg.csa_m
         self.top_k = cfg.csa_top_k
+        self.chunk_size = cfg.csa_chunk
         # Toggle for the eval-time top-k filter. Set False to evaluate
         # densely (no top-k), used by the training loop's dual eval to
         # report the train/eval mismatch metric (D3).
@@ -297,10 +311,10 @@ class CSAAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Returns (residual_delta, aux) where aux holds tensors needed by the
         V3.2 indexer KL loss at MiniTransformer level: `p` (teacher target,
-        detached) and `I_masked` (indexer scores with -inf on causally-invalid
-        blocks)."""
+        detached) and `I_masked` (indexer scores with causally-invalid blocks
+        masked out)."""
         n = x.shape[1]
-        m, c = self.m, self.c
+        m = self.m
         n_blk = n // m
 
         # Indexer produces both the per-block scores and the shared latent c^Q.
@@ -314,50 +328,100 @@ class CSAAttention(nn.Module):
         kv = self.compress(x)        # (b, n_blk, c)
         kv = self.k_norm(kv)
 
-        # Core attention logits. Indexer scores no longer feed back as an
-        # additive bias — they only drive eval-time top-k selection below.
-        scores = einsum(q, kv, "b n h c, b s c -> b h n s") / math.sqrt(c)  # (b, h, n, n_blk)
-
         # Causal mask: token index t may attend to blocks s < t // m.
         device = x.device
         token_idx = torch.arange(n, device=device).unsqueeze(1)             # (n, 1)
         block_idx = torch.arange(n_blk, device=device).unsqueeze(0)         # (1, n_blk)
         causal = block_idx < (token_idx // m)                               # (n, n_blk)
-        scores = scores.masked_fill(~causal, float("-inf"))
+        # Positions t < m have no causally-valid block at all. Their rows are
+        # fully masked, and _MASK_FILL makes them softmax to uniform rather
+        # than NaN; _attend zeroes their output and teacher rows explicitly.
+        row_valid = causal.any(dim=-1)                                      # (n,)
+
+        apply_topk = (not self.training) and self.eval_apply_topk and self.top_k < n_blk
+
+        # Chunk over query positions. Purely a memory device: each chunk's
+        # score matrix and its masked/softmaxed copies are freed before the
+        # next chunk allocates, so peak transient memory scales with
+        # chunk_size rather than n. Results are identical to one shot.
+        chunk = self.chunk_size if self.chunk_size > 0 else n
+        outs: list[torch.Tensor] = []
+        ps: list[torch.Tensor] = []
+        for lo in range(0, n, chunk):
+            hi = min(lo + chunk, n)
+            out_c, p_c = self._attend(
+                q[:, lo:hi],
+                kv,
+                causal[lo:hi],
+                indexer_scores[:, lo:hi],
+                row_valid[lo:hi],
+                apply_topk,
+            )
+            outs.append(out_c)
+            ps.append(p_c)
+
+        out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        p = ps[0] if len(ps) == 1 else torch.cat(ps, dim=1)
+
+        aux = {
+            "p": p,
+            "I_masked": indexer_scores.masked_fill(~causal, _MASK_FILL),
+        }
+        return self.W_O(out), aux
+
+    def _attend(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        causal: torch.Tensor,
+        indexer_scores: torch.Tensor,
+        row_valid: torch.Tensor,
+        apply_topk: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Core attention for one chunk of query positions.
+
+        Shapes: q (b, n_c, h, c), kv (b, n_blk, c), causal (n_c, n_blk),
+        indexer_scores (b, n_c, n_blk), row_valid (n_c,).
+        Returns (out (b, n_c, h*c), p (b, n_c, n_blk) detached).
+        """
+        # Core attention logits. Indexer scores no longer feed back as an
+        # additive bias — they only drive eval-time top-k selection below.
+        scores = einsum(q, kv, "b n h c, b s c -> b h n s") / math.sqrt(self.c)
+        scores = scores.masked_fill(~causal, _MASK_FILL)
 
         # Top-k selection (eval / sparse-training phase). Indexer's
         # causally-masked scores choose which blocks survive; same set
-        # applied to all query heads (MQA: all heads share K=V).
-        if (not self.training) and self.eval_apply_topk and self.top_k < n_blk:
-            masked_idx = indexer_scores.masked_fill(~causal, float("-inf"))
-            _, topk_idx = masked_idx.topk(k=self.top_k, dim=-1)             # (b, n, k)
+        # applied to all query heads (MQA: all heads share K=V). Indexer
+        # scores are ReLU sums (>= 0), so any causally-valid block outranks
+        # every masked one and a valid row always keeps >= 1 valid block.
+        if apply_topk:
+            masked_idx = indexer_scores.masked_fill(~causal, _MASK_FILL)
+            _, topk_idx = masked_idx.topk(k=self.top_k, dim=-1)             # (b, n_c, k)
             keep = torch.zeros_like(masked_idx, dtype=torch.bool)
-            keep.scatter_(-1, topk_idx, True)                                # (b, n, n_blk)
-            scores = scores.masked_fill(~keep.unsqueeze(1), float("-inf"))
+            keep.scatter_(-1, topk_idx, True)                                # (b, n_c, n_blk)
+            scores = scores.masked_fill(~keep.unsqueeze(1), _MASK_FILL)
 
-        # Safe softmax: rows that are fully -inf (positions t < m, or top-k
-        # rows where every kept block is causally invalid) yield NaN; replace
-        # with zero so the output is deterministic zero for those positions.
         attn = F.softmax(scores, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)
 
         # V3.2 eq. 3: teacher target p_{t,:} = L1-normalize_seq(sum_h attn).
         # Detached so L_I doesn't push gradient back into the attention path
         # (we want the indexer to chase attention, not the other way around).
-        # Rows for positions t < m have attn = 0, so the sum is 0 and the
-        # L1-normalization yields a zero row — those positions contribute
-        # nothing to KL (and are loss-masked anyway).
-        p = attn.sum(dim=1)                                                  # (b, n, n_blk)
+        p = attn.sum(dim=1)                                                  # (b, n_c, n_blk)
         p_sum = p.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         p = (p / p_sum).detach()
 
         out = einsum(attn, kv, "b h n s, b s c -> b h n c")
         out = rearrange(out, "b h n c -> b n (h c)")
-        aux = {
-            "p": p,
-            "I_masked": indexer_scores.masked_fill(~causal, float("-inf")),
-        }
-        return self.W_O(out), aux
+
+        # Fully-masked rows (t < m) softmaxed to uniform over invalid blocks.
+        # Force their output and their teacher row to zero, matching the
+        # "no causally-valid block => no attention output" contract. Done on
+        # `out` (b, n_c, h*c) rather than on `attn` (b, h, n_c, n_blk) because
+        # `out` is smaller by a factor of n_blk / c.
+        gate = row_valid.view(1, -1, 1)
+        out = out * gate.to(out.dtype)
+        p.masked_fill_(~gate, 0.0)                                           # p is detached
+        return out, p
 
 
 def _build_attention(cfg: ModelConfig) -> nn.Module:
@@ -475,18 +539,33 @@ class MiniTransformer(nn.Module):
         total = 0.0
         for aux in auxes:
             p = aux["p"]              # (b, n, n_blk); zero rows for t < m
-            I_m = aux["I_masked"]     # (b, n, n_blk); -inf on causally invalid blocks
+            I_m = aux["I_masked"]     # (b, n, n_blk); _MASK_FILL on invalid blocks
 
-            log_q = F.log_softmax(I_m, dim=-1)
-            # log_q is NaN for fully-invalid rows (t<m). Zero them; those rows
-            # have p=0 anyway and their contribution to KL is 0.
-            log_q = torch.nan_to_num(log_q, nan=0.0, neginf=0.0)
-
-            log_p = torch.log(p.clamp_min(1e-30))
-            # contribution per (b, n, s); convention 0 * anything = 0.
-            contrib = p * (log_p - log_q)
-            contrib = torch.where(p > 0, contrib, torch.zeros_like(contrib))
-            kl_per_pos = contrib.sum(dim=-1)                    # (b, n)
+            # Expanded form of D_KL(p || softmax(I)), which avoids ever
+            # materializing log_softmax(I):
+            #
+            #   KL = sum_s p_s log p_s - sum_s p_s log q_s
+            #      = sum_s p_s log p_s - sum_s p_s I_s + logsumexp(I) * sum_s p_s
+            #
+            # The log_softmax output is a full (b, n, n_blk) fp32 tensor that
+            # autograd must keep for backward (1.2GB per layer at n=16384);
+            # `logsumexp` keeps only its (b, n) output instead. Algebraically
+            # identical, and exact rather than approximate.
+            #
+            # This relies on I_m being masked with a large *finite* value: with
+            # -inf, the p_s * I_s product at masked blocks would be 0 * -inf =
+            # NaN rather than 0.
+            #
+            # The entropy term depends only on the detached teacher, so it is
+            # computed under no_grad and adds nothing to the graph. xlogy gives
+            # the 0 log 0 = 0 convention directly.
+            with torch.no_grad():
+                neg_entropy = torch.xlogy(p, p).sum(dim=-1)     # (b, n)
+            # sum_s p_s is 1 on valid rows and exactly 0 on fully-masked ones
+            # (t < m), which zeroes those rows' KL as the -inf form did.
+            p_mass = p.sum(dim=-1)                              # (b, n)
+            cross = (p * I_m).sum(dim=-1) - torch.logsumexp(I_m, dim=-1) * p_mass
+            kl_per_pos = neg_entropy - cross                    # (b, n)
 
             if loss_mask is not None:
                 kl_per_pos = kl_per_pos * loss_mask

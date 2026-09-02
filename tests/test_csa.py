@@ -671,3 +671,84 @@ def _run_all() -> None:
 
 if __name__ == "__main__":
     _run_all()
+
+
+# ---------------------------------------------------------------------------
+# Memory-motivated refactors: both must be exactly output-preserving.
+# ---------------------------------------------------------------------------
+
+
+def _csa_model(**kw):
+    cfg = model.ModelConfig(
+        attention="csa", vocab_size=37, d_model=48, n_layers=2, n_heads=4,
+        block_size=64, csa_m=4, csa_top_k=5, **kw,
+    )
+    torch.manual_seed(1234)
+    return model.MiniTransformer(cfg).double()
+
+
+def _run(m, apply_topk):
+    torch.manual_seed(9)
+    idx = torch.randint(0, 37, (2, 64))
+    tgt = torch.randint(0, 37, (2, 64))
+    mask = torch.ones(2, 64)
+    mask[:, :4] = 0.0
+    for blk in m.blocks:
+        blk.attn.eval_apply_topk = apply_topk
+    logits, lm, kl = m(idx, tgt, loss_mask=mask)
+    return logits, lm, kl
+
+
+def test_query_chunking_is_exact():
+    """csa_chunk is a memory knob only — it must not move any number.
+
+    The score matrix is (b, n_heads, n, n_blk) and autocast runs softmax in
+    fp32, so at 16K it is 1.5GB per layer; chunking bounds the transient
+    copies. Any numerical drift here would silently confound the sweep.
+    """
+    for topk in (False, True):
+        ref = _csa_model(csa_chunk=0)
+        ref.train(not topk)
+        base = _run(ref, topk)
+        for chunk in (8, 16, 32, 64, 128):
+            m = _csa_model(csa_chunk=chunk)
+            m.train(not topk)
+            got = _run(m, topk)
+            for b, g, name in zip(base, got, ("logits", "lm_loss", "kl")):
+                assert torch.equal(b, g), f"chunk={chunk} topk={topk} changed {name}"
+
+
+def test_fully_masked_rows_produce_zero_output_and_no_nan():
+    """Positions t < m have no causally-valid block. The mask uses a large
+    finite value rather than -inf (so softmax yields uniform, not NaN); the
+    zeroing must therefore happen explicitly on the output."""
+    m = _csa_model()
+    m.eval()
+    torch.manual_seed(3)
+    x = torch.randn(2, 64, 48, dtype=torch.float64)
+    attn = m.blocks[0].attn
+    out, aux = attn(x)
+    assert torch.isfinite(out).all(), "attention output contains NaN/inf"
+    assert torch.equal(out[:, :attn.m], torch.zeros_like(out[:, :attn.m]))
+    assert torch.equal(aux["p"][:, :attn.m], torch.zeros_like(aux["p"][:, :attn.m]))
+    # Teacher rows for valid positions must still be probability distributions.
+    assert torch.allclose(aux["p"][:, attn.m:].sum(-1), torch.ones(2, 64 - attn.m, dtype=torch.float64))
+
+
+def test_indexer_kl_matches_explicit_log_softmax_form():
+    """The KL is computed via the logsumexp identity to avoid materializing
+    log_softmax(I) (a full (b, n, n_blk) fp32 tensor kept for backward).
+    Check it against the literal textbook form."""
+    m = _csa_model()
+    m.train()
+    torch.manual_seed(5)
+    x = torch.randn(2, 64, 48, dtype=torch.float64)
+    _, aux = m.blocks[0].attn(x)
+    p, I_m = aux["p"], aux["I_masked"]
+
+    log_q = torch.log_softmax(I_m, dim=-1)
+    contrib = p * (torch.log(p.clamp_min(1e-30)) - log_q)
+    expected = torch.where(p > 0, contrib, torch.zeros_like(contrib)).sum(-1)
+
+    got = m._indexer_kl_loss([aux], loss_mask=None)
+    assert torch.allclose(got, expected.mean(), atol=1e-12), f"{got} vs {expected.mean()}"
