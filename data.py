@@ -53,6 +53,15 @@ PG19_LIST_URL = "https://storage.googleapis.com/storage/v1/b/{bucket}/o"
 PG19_FILE_URL = "https://storage.googleapis.com/{bucket}/{name}"
 PG19_DIR = DATA_DIR / "pg19"
 PG19_SUBSET_SEED = 1337
+# Bytes occurring fewer than this many times in *train* are folded into a single
+# <rare> id. PG-19 has a long tail of high-byte values from a handful of books:
+# 45 of its 170 raw byte values occur under 100 times, and 4 never occur in
+# train at all while appearing in test. With tied embeddings those rows are
+# effectively untrained, so each occurrence produces a large gradient on a
+# near-init row. The whole folded tail is 0.0013% of the corpus. enwiki8 needs
+# no such treatment (min train count 2, nothing test-only) and is deliberately
+# left untouched so its existing runs stay reproducible.
+PG19_MIN_TRAIN_COUNT = 100
 PG19_BUDGETS = {"train": 90_000_000, "validation": 5_000_000, "test": 5_000_000}
 PG19_SPLIT_NAMES = {"train": "train", "validation": "val", "test": "test"}
 
@@ -165,6 +174,28 @@ def _load_enwiki8() -> CharDataset:
 # ---------------------------------------------------------------------------
 
 
+def build_byte_vocab(
+    train_bytes: bytes, min_count: int
+) -> tuple[np.ndarray, dict, dict, int]:
+    """Byte vocab from *train* counts, folding the untrainable tail.
+
+    Returns (lut, stoi, itos, vocab_size) where `lut` maps all 256 byte values
+    to token ids. Bytes below `min_count` — including any byte that never
+    appears in train but shows up in val/test — collapse onto one <rare> id, so
+    no evaluated token can be one the model has never been trained on.
+    """
+    counts = np.bincount(np.frombuffer(train_bytes, dtype=np.uint8), minlength=256)
+    kept = [int(b) for b in np.flatnonzero(counts >= max(1, min_count))]
+    stoi = {b: i for i, b in enumerate(kept)}
+    rare_id = len(kept)
+    lut = np.full(256, rare_id, dtype=np.int64)
+    for b, i in stoi.items():
+        lut[b] = i
+    itos = {i: b for b, i in stoi.items()}
+    itos[rare_id] = ord("?")   # decode-only placeholder; the fold is lossy
+    return lut, stoi, itos, rare_id + 1
+
+
 def _pg19_list(split: str) -> list[tuple[str, int]]:
     """List (object_name, size) under a PG-19 split prefix, sorted by book id.
 
@@ -262,26 +293,30 @@ def _download_pg19() -> tuple[dict[str, bytes], dict[str, list[int]]]:
 
 def _load_pg19() -> CharDataset:
     raw, starts = _download_pg19()
-    # Vocab over the union of splits, as enwiki8 does, so no split can contain
-    # a byte the lookup table has never seen.
-    byte_values = sorted(set().union(*(set(v) for v in raw.values())))
-    stoi = {b: i for i, b in enumerate(byte_values)}
-    itos = {i: b for b, i in stoi.items()}
-    lut = np.full(256, -1, dtype=np.int64)
-    for b, i in stoi.items():
-        lut[b] = i
+    # Vocab from train counts only, with the untrainable tail folded into one
+    # <rare> id. Building it over the union of splits (as enwiki8 does) would
+    # mint embedding rows for bytes that never occur in training.
+    lut, stoi, itos, vocab_size = build_byte_vocab(raw["train"], PG19_MIN_TRAIN_COUNT)
+    folded = int((lut == vocab_size - 1).sum())
+    rare_hits = sum(
+        int((lut[np.frombuffer(b, dtype=np.uint8)] == vocab_size - 1).sum())
+        for b in raw.values()
+    )
+    print(
+        f"[data] pg19 vocab={vocab_size} ({folded} byte values folded into <rare>, "
+        f"{rare_hits:,} occurrences across all splits)"
+    )
 
     tensors: dict[str, torch.Tensor] = {}
     for split, blob in raw.items():
-        ids = lut[np.frombuffer(blob, dtype=np.uint8).astype(np.int64)]
-        assert (ids >= 0).all(), f"unmapped byte in pg19 {split}"
+        ids = lut[np.frombuffer(blob, dtype=np.uint8)]
         tensors[PG19_SPLIT_NAMES[split]] = torch.from_numpy(ids)
 
     return CharDataset(
         train=tensors["train"],
         val=tensors["val"],
         test=tensors["test"],
-        vocab_size=len(byte_values),
+        vocab_size=vocab_size,
         stoi=stoi,
         itos=itos,
         doc_starts={

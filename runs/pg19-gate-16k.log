@@ -1,0 +1,347 @@
+[setup] device=cuda
+[data]  pg19  vocab=170, train=90,330,851 tokens, val=5,220,809, test=5,433,972
+[data]  document-aware sampling: 225 train documents long enough for block_size=16384 (86,597,916 distinct windows)
+[model] vanilla, params=16,978,560 (excl emb=10,621,824)
+[run]   logging to /home/cypher/a_repos/BrettCleary/mini-deepseek-v4/runs/pg19-gate-16k
+[opt]   amp=bf16, grad_accum_steps=32, effective_batch=32
+[lr]    cosine, warmup=500, horizon=10000, 3.00e-04 -> 3.00e-05
+[eval]  step     0  train 5.2863 (ppl 197.60)  val 5.2921 (ppl 198.76)  best 5.2921@0 (0/-)
+[train] step    50  loss 3.5159  lr 3.06e-05  grad 2.03  tok/s 195,028
+[eval]  step   100  train 2.8118 (ppl 16.64)  val 2.7702 (ppl 15.96)  best 2.7702@100 (0/-)
+[train] step   100  loss 2.8215  lr 6.06e-05  grad 1.87  tok/s 199,038
+[train] step   150  loss 2.6201  lr 9.06e-05  grad 0.83  tok/s 203,036
+[eval]  step   200  train 2.5228 (ppl 12.46)  val 2.4771 (ppl 11.91)  best 2.4771@200 (0/-)
+[train] step   200  loss 2.5092  lr 1.21e-04  grad 0.67  tok/s 199,410
+[train] step   250  loss 2.4953  lr 1.51e-04  grad 1.03  tok/s 203,303
+[eval]  step   300  train 2.4641 (ppl 11.75)  val 2.4405 (ppl 11.48)  best 2.4405@300 (0/-)
+[train] step   300  loss 2.4757  lr 1.81e-04  grad 0.41  tok/s 199,537
+[train] step   350  loss 2.4495  lr 2.11e-04  grad 0.49  tok/s 203,364
+[eval]  step   400  train 2.4272 (ppl 11.33)  val 2.4317 (ppl 11.38)  best 2.4317@400 (0/-)
+[train] step   400  loss 2.4289  lr 2.41e-04  grad 0.33  tok/s 199,518
+[train] step   450  loss 2.4336  lr 2.71e-04  grad 0.23  tok/s 203,373
+[eval]  step   500  train 2.4305 (ppl 11.36)  val 2.4320 (ppl 11.38)  best 2.4317@400 (1/-)
+[train] step   500  loss 2.4422  lr 3.00e-04  grad 0.48  tok/s 199,556
+[train] step   550  loss 2.4546  lr 3.00e-04  grad 0.27  tok/s 203,336
+[eval]  step   600  train 2.4238 (ppl 11.29)  val 2.4417 (ppl 11.49)  best 2.4317@400 (2/-)
+[train] step   600  loss 2.4314  lr 3.00e-04  grad 0.27  tok/s 199,584
+[train] step   650  loss 2.4272  lr 3.00e-04  grad 0.18  tok/s 203,338
+[eval]  step   700  train 2.4140 (ppl 11.18)  val 2.4159 (ppl 11.20)  best 2.4159@700 (0/-)
+[train] step   700  loss 2.4269  lr 3.00e-04  grad 0.16  tok/s 199,411
+[train] step   750  loss 2.4212  lr 3.00e-04  grad 0.22  tok/s 203,329
+[eval]  step   800  train 2.4132 (ppl 11.17)  val 2.4095 (ppl 11.13)  best 2.4095@800 (0/-)
+[train] step   800  loss 2.4235  lr 2.99e-04  grad 0.23  tok/s 199,520
+[train] step   850  loss 2.4280  lr 2.99e-04  grad 0.21  tok/s 203,310
+[eval]  step   900  train 2.4390 (ppl 11.46)  val 2.4066 (ppl 11.10)  best 2.4066@900 (0/-)
+[train] step   900  loss 2.3956  lr 2.99e-04  grad 0.20  tok/s 199,495
+[train] step   950  loss 2.4001  lr 2.99e-04  grad 0.32  tok/s 203,389
+[eval]  step  1000  train 2.3883 (ppl 10.89)  val 2.3901 (ppl 10.91)  best 2.3901@1000 (0/-)
+[train] step  1000  loss 2.3903  lr 2.98e-04  grad 0.20  tok/s 198,099
+[train] step  1050  loss 2.3910  lr 2.98e-04  grad 0.32  tok/s 203,297
+[eval]  step  1100  train 2.3764 (ppl 10.77)  val 2.3718 (ppl 10.72)  best 2.3718@1100 (0/-)
+[train] step  1100  loss 2.3727  lr 2.97e-04  grad 0.64  tok/s 199,536
+[train] step  1150  loss 2.3000  lr 2.97e-04  grad 0.36  tok/s 203,327
+[eval]  step  1200  train 2.3200 (ppl 10.18)  val 2.3299 (ppl 10.28)  best 2.3299@1200 (0/-)
+[train] step  1200  loss 2.3058  lr 2.96e-04  grad 0.60  tok/s 199,493
+[train] step  1250  loss 2.3007  lr 2.96e-04  grad 0.71  tok/s 203,338
+[eval]  step  1300  train 2.1901 (ppl 8.94)  val 2.1949 (ppl 8.98)  best 2.1949@1300 (0/-)
+[train] step  1300  loss 2.1958  lr 2.95e-04  grad 1.48  tok/s 199,555
+[train] step  1350  loss 2.0868  lr 2.95e-04  grad 1.31  tok/s 203,471
+[eval]  step  1400  train 2.0525 (ppl 7.79)  val 2.0314 (ppl 7.63)  best 2.0314@1400 (0/-)
+[train] step  1400  loss 2.0488  lr 2.94e-04  grad 1.82  tok/s 199,614
+[train] step  1450  loss 1.9842  lr 2.93e-04  grad 2.50  tok/s 203,462
+[eval]  step  1500  train 1.9305 (ppl 6.89)  val 1.9075 (ppl 6.74)  best 1.9075@1500 (0/-)
+[train] step  1500  loss 1.9123  lr 2.93e-04  grad 1.35  tok/s 199,651
+[train] step  1550  loss 1.8374  lr 2.92e-04  grad 1.96  tok/s 203,443
+[eval]  step  1600  train 1.7766 (ppl 5.91)  val 1.7468 (ppl 5.74)  best 1.7468@1600 (0/-)
+[train] step  1600  loss 1.7592  lr 2.91e-04  grad 1.95  tok/s 199,589
+[train] step  1650  loss 1.6784  lr 2.90e-04  grad 2.58  tok/s 203,432
+[eval]  step  1700  train 1.6615 (ppl 5.27)  val 1.6443 (ppl 5.18)  best 1.6443@1700 (0/-)
+[train] step  1700  loss 1.6366  lr 2.90e-04  grad 2.04  tok/s 199,559
+[train] step  1750  loss 1.6187  lr 2.89e-04  grad 2.59  tok/s 203,403
+[eval]  step  1800  train 1.5888 (ppl 4.90)  val 1.5671 (ppl 4.79)  best 1.5671@1800 (0/-)
+[train] step  1800  loss 1.5815  lr 2.88e-04  grad 2.74  tok/s 199,573
+[train] step  1850  loss 1.5487  lr 2.87e-04  grad 2.93  tok/s 203,494
+[eval]  step  1900  train 1.5639 (ppl 4.78)  val 1.5450 (ppl 4.69)  best 1.5450@1900 (0/-)
+[train] step  1900  loss 1.5471  lr 2.86e-04  grad 3.72  tok/s 199,614
+[train] step  1950  loss 1.5478  lr 2.85e-04  grad 4.16  tok/s 203,524
+[eval]  step  2000  train 1.5233 (ppl 4.59)  val 1.5252 (ppl 4.60)  best 1.5252@2000 (0/-)
+[train] step  2000  loss 1.5916  lr 2.84e-04  grad 4.01  tok/s 199,713
+[train] step  2050  loss 1.5323  lr 2.83e-04  grad 3.64  tok/s 203,587
+[eval]  step  2100  train 1.5184 (ppl 4.56)  val 1.5163 (ppl 4.56)  best 1.5163@2100 (0/-)
+[train] step  2100  loss 1.5342  lr 2.82e-04  grad 4.62  tok/s 199,799
+[train] step  2150  loss 1.5801  lr 2.80e-04  grad 7.07  tok/s 203,662
+[eval]  step  2200  train 1.5931 (ppl 4.92)  val 1.5843 (ppl 4.88)  best 1.5163@2100 (1/-)
+[train] step  2200  loss 1.6013  lr 2.79e-04  grad 7.37  tok/s 199,829
+[train] step  2250  loss 1.8966  lr 2.78e-04  grad 33.16  tok/s 203,655
+[eval]  step  2300  train 1.6511 (ppl 5.21)  val 1.6581 (ppl 5.25)  best 1.5163@2100 (2/-)
+[train] step  2300  loss 1.7191  lr 2.77e-04  grad 8.84  tok/s 199,883
+[train] step  2350  loss 1.7771  lr 2.76e-04  grad 15.24  tok/s 203,700
+[eval]  step  2400  train 1.9017 (ppl 6.70)  val 1.8892 (ppl 6.61)  best 1.5163@2100 (3/-)
+[train] step  2400  loss 1.8744  lr 2.74e-04  grad 19.43  tok/s 199,883
+[train] step  2450  loss 1.8524  lr 2.73e-04  grad 17.89  tok/s 203,662
+[eval]  step  2500  train 1.8410 (ppl 6.30)  val 1.8220 (ppl 6.18)  best 1.5163@2100 (4/-)
+[train] step  2500  loss 1.8156  lr 2.72e-04  grad 19.16  tok/s 199,832
+[train] step  2550  loss 1.8244  lr 2.70e-04  grad 15.52  tok/s 203,677
+[eval]  step  2600  train 1.8518 (ppl 6.37)  val 1.8308 (ppl 6.24)  best 1.5163@2100 (5/-)
+[train] step  2600  loss 1.8812  lr 2.69e-04  grad 26.17  tok/s 199,847
+[train] step  2650  loss 1.8795  lr 2.67e-04  grad 22.22  tok/s 203,688
+[eval]  step  2700  train 1.9048 (ppl 6.72)  val 1.8920 (ppl 6.63)  best 1.5163@2100 (6/-)
+[train] step  2700  loss 1.8953  lr 2.66e-04  grad 27.83  tok/s 199,901
+[train] step  2750  loss 1.8378  lr 2.64e-04  grad 33.37  tok/s 203,665
+[eval]  step  2800  train 1.8204 (ppl 6.17)  val 1.7918 (ppl 6.00)  best 1.5163@2100 (7/-)
+[train] step  2800  loss 1.8030  lr 2.63e-04  grad 27.20  tok/s 199,829
+[train] step  2850  loss 1.8238  lr 2.61e-04  grad 37.05  tok/s 203,673
+[eval]  step  2900  train 1.8431 (ppl 6.32)  val 1.7851 (ppl 5.96)  best 1.5163@2100 (8/-)
+[train] step  2900  loss 1.8263  lr 2.60e-04  grad 31.96  tok/s 199,869
+[train] step  2950  loss 1.9329  lr 2.58e-04  grad 26.16  tok/s 203,665
+[eval]  step  3000  train 1.7326 (ppl 5.66)  val 1.7152 (ppl 5.56)  best 1.5163@2100 (9/-)
+[train] step  3000  loss 1.7226  lr 2.56e-04  grad 19.04  tok/s 199,843
+[train] step  3050  loss 1.7589  lr 2.55e-04  grad 23.99  tok/s 203,661
+[eval]  step  3100  train 1.9010 (ppl 6.69)  val 1.8791 (ppl 6.55)  best 1.5163@2100 (10/-)
+[train] step  3100  loss 1.9007  lr 2.53e-04  grad 33.58  tok/s 199,847
+[train] step  3150  loss 1.7121  lr 2.51e-04  grad 23.01  tok/s 203,674
+[eval]  step  3200  train 1.6650 (ppl 5.29)  val 1.6678 (ppl 5.30)  best 1.5163@2100 (11/-)
+[train] step  3200  loss 1.6687  lr 2.50e-04  grad 17.95  tok/s 199,851
+[train] step  3250  loss 1.6881  lr 2.48e-04  grad 16.48  tok/s 203,676
+[eval]  step  3300  train 1.7224 (ppl 5.60)  val 1.6827 (ppl 5.38)  best 1.5163@2100 (12/-)
+[train] step  3300  loss 1.7047  lr 2.46e-04  grad 26.34  tok/s 199,893
+[train] step  3350  loss 1.7311  lr 2.44e-04  grad 18.55  tok/s 203,724
+[eval]  step  3400  train 1.7339 (ppl 5.66)  val 1.7105 (ppl 5.53)  best 1.5163@2100 (13/-)
+[train] step  3400  loss 1.7167  lr 2.43e-04  grad 19.79  tok/s 199,957
+[train] step  3450  loss 1.7140  lr 2.41e-04  grad 30.22  tok/s 203,704
+[eval]  step  3500  train 1.6368 (ppl 5.14)  val 1.6167 (ppl 5.04)  best 1.5163@2100 (14/-)
+[train] step  3500  loss 1.6834  lr 2.39e-04  grad 20.40  tok/s 199,922
+[train] step  3550  loss 1.6646  lr 2.37e-04  grad 18.88  tok/s 203,717
+[eval]  step  3600  train 1.5882 (ppl 4.89)  val 1.6088 (ppl 5.00)  best 1.5163@2100 (15/-)
+[train] step  3600  loss 1.6051  lr 2.35e-04  grad 18.20  tok/s 199,904
+[train] step  3650  loss 1.7271  lr 2.33e-04  grad 20.63  tok/s 203,729
+[eval]  step  3700  train 1.7700 (ppl 5.87)  val 1.7398 (ppl 5.70)  best 1.5163@2100 (16/-)
+[train] step  3700  loss 1.7496  lr 2.31e-04  grad 27.33  tok/s 199,900
+[train] step  3750  loss 1.7047  lr 2.29e-04  grad 20.78  tok/s 203,694
+[eval]  step  3800  train 1.8679 (ppl 6.47)  val 1.8477 (ppl 6.35)  best 1.5163@2100 (17/-)
+[train] step  3800  loss 1.8985  lr 2.27e-04  grad 30.58  tok/s 199,901
+[train] step  3850  loss 1.8621  lr 2.25e-04  grad 19.79  tok/s 203,723
+[eval]  step  3900  train 1.8304 (ppl 6.24)  val 1.8162 (ppl 6.15)  best 1.5163@2100 (18/-)
+[train] step  3900  loss 1.8315  lr 2.23e-04  grad 30.52  tok/s 199,881
+[train] step  3950  loss 1.8313  lr 2.21e-04  grad 31.00  tok/s 203,697
+[eval]  step  4000  train 1.8663 (ppl 6.46)  val 1.8691 (ppl 6.48)  best 1.5163@2100 (19/-)
+[train] step  4000  loss 1.8676  lr 2.19e-04  grad 20.12  tok/s 199,856
+[train] step  4050  loss 1.9596  lr 2.17e-04  grad 44.13  tok/s 203,700
+[eval]  step  4100  train 1.9068 (ppl 6.73)  val 1.8734 (ppl 6.51)  best 1.5163@2100 (20/-)
+[train] step  4100  loss 1.8808  lr 2.15e-04  grad 48.72  tok/s 199,900
+[train] step  4150  loss 2.0023  lr 2.13e-04  grad 33.80  tok/s 203,672
+[eval]  step  4200  train 2.0319 (ppl 7.63)  val 2.0340 (ppl 7.64)  best 1.5163@2100 (21/-)
+[train] step  4200  loss 2.0120  lr 2.11e-04  grad 25.89  tok/s 199,825
+[train] step  4250  loss 2.1111  lr 2.09e-04  grad 36.31  tok/s 203,647
+[eval]  step  4300  train 2.0180 (ppl 7.52)  val 2.0187 (ppl 7.53)  best 1.5163@2100 (22/-)
+[train] step  4300  loss 2.0156  lr 2.07e-04  grad 58.72  tok/s 199,832
+[train] step  4350  loss 1.9819  lr 2.05e-04  grad 25.39  tok/s 203,648
+[eval]  step  4400  train 2.0386 (ppl 7.68)  val 2.0166 (ppl 7.51)  best 1.5163@2100 (23/-)
+[train] step  4400  loss 2.0016  lr 2.02e-04  grad 44.26  tok/s 199,834
+[train] step  4450  loss 1.9761  lr 2.00e-04  grad 38.84  tok/s 203,665
+[eval]  step  4500  train 2.0198 (ppl 7.54)  val 2.0148 (ppl 7.50)  best 1.5163@2100 (24/-)
+[train] step  4500  loss 2.0044  lr 1.98e-04  grad 25.84  tok/s 199,870
+[train] step  4550  loss 2.0056  lr 1.96e-04  grad 57.67  tok/s 203,676
+[eval]  step  4600  train 1.9513 (ppl 7.04)  val 1.9185 (ppl 6.81)  best 1.5163@2100 (25/-)
+[train] step  4600  loss 1.9220  lr 1.94e-04  grad 29.26  tok/s 199,844
+[train] step  4650  loss 1.9329  lr 1.92e-04  grad 37.50  tok/s 203,673
+[eval]  step  4700  train 2.0374 (ppl 7.67)  val 2.0449 (ppl 7.73)  best 1.5163@2100 (26/-)
+[train] step  4700  loss 2.0601  lr 1.89e-04  grad 35.64  tok/s 199,856
+[train] step  4750  loss 1.9151  lr 1.87e-04  grad 31.53  tok/s 203,660
+[eval]  step  4800  train 2.2144 (ppl 9.16)  val 2.2078 (ppl 9.10)  best 1.5163@2100 (27/-)
+[train] step  4800  loss 2.2086  lr 1.85e-04  grad 24.75  tok/s 199,936
+[train] step  4850  loss 1.9778  lr 1.83e-04  grad 21.76  tok/s 203,655
+[eval]  step  4900  train 1.9410 (ppl 6.97)  val 1.9279 (ppl 6.87)  best 1.5163@2100 (28/-)
+[train] step  4900  loss 1.9420  lr 1.81e-04  grad 24.99  tok/s 199,868
+[train] step  4950  loss 2.1094  lr 1.78e-04  grad 35.65  tok/s 203,670
+[eval]  step  5000  train 2.0493 (ppl 7.76)  val 2.0223 (ppl 7.56)  best 1.5163@2100 (29/-)
+[train] step  5000  loss 2.0424  lr 1.76e-04  grad 33.14  tok/s 199,893
+[train] step  5050  loss 2.0465  lr 1.74e-04  grad 44.39  tok/s 203,683
+[eval]  step  5100  train 2.0186 (ppl 7.53)  val 1.9830 (ppl 7.26)  best 1.5163@2100 (30/-)
+[train] step  5100  loss 1.9878  lr 1.72e-04  grad 32.79  tok/s 199,848
+[train] step  5150  loss 2.0435  lr 1.69e-04  grad 67.11  tok/s 203,653
+[eval]  step  5200  train 2.0372 (ppl 7.67)  val 2.0353 (ppl 7.65)  best 1.5163@2100 (31/-)
+[train] step  5200  loss 2.0356  lr 1.67e-04  grad 24.86  tok/s 199,871
+[train] step  5250  loss 2.0372  lr 1.65e-04  grad 161.73  tok/s 203,683
+[eval]  step  5300  train 2.1020 (ppl 8.18)  val 2.0944 (ppl 8.12)  best 1.5163@2100 (32/-)
+[train] step  5300  loss 2.1508  lr 1.63e-04  grad 38.65  tok/s 199,870
+[train] step  5350  loss 2.2098  lr 1.61e-04  grad 53.44  tok/s 203,670
+[eval]  step  5400  train 2.1536 (ppl 8.62)  val 2.1420 (ppl 8.52)  best 1.5163@2100 (33/-)
+[train] step  5400  loss 2.1582  lr 1.58e-04  grad 34.80  tok/s 199,865
+[train] step  5450  loss 1.9717  lr 1.56e-04  grad 45.10  tok/s 203,712
+[eval]  step  5500  train 1.9548 (ppl 7.06)  val 1.9475 (ppl 7.01)  best 1.5163@2100 (34/-)
+[train] step  5500  loss 1.9832  lr 1.54e-04  grad 41.10  tok/s 199,927
+[train] step  5550  loss 1.9357  lr 1.52e-04  grad 34.47  tok/s 203,680
+[eval]  step  5600  train 2.0596 (ppl 7.84)  val 2.0413 (ppl 7.70)  best 1.5163@2100 (35/-)
+[train] step  5600  loss 2.0766  lr 1.49e-04  grad 62.50  tok/s 199,861
+[train] step  5650  loss 1.9229  lr 1.47e-04  grad 49.28  tok/s 203,637
+[eval]  step  5700  train 2.0208 (ppl 7.54)  val 1.9857 (ppl 7.28)  best 1.5163@2100 (36/-)
+[train] step  5700  loss 2.0164  lr 1.45e-04  grad 60.70  tok/s 199,857
+[train] step  5750  loss 1.9296  lr 1.43e-04  grad 51.97  tok/s 203,632
+[eval]  step  5800  train 1.9949 (ppl 7.35)  val 1.9751 (ppl 7.21)  best 1.5163@2100 (37/-)
+[train] step  5800  loss 1.9927  lr 1.41e-04  grad 51.62  tok/s 199,852
+[train] step  5850  loss 1.9066  lr 1.38e-04  grad 33.26  tok/s 203,658
+[eval]  step  5900  train 2.0225 (ppl 7.56)  val 1.9984 (ppl 7.38)  best 1.5163@2100 (38/-)
+[train] step  5900  loss 2.0185  lr 1.36e-04  grad 35.30  tok/s 199,882
+[train] step  5950  loss 1.9429  lr 1.34e-04  grad 90.54  tok/s 203,692
+[eval]  step  6000  train 1.8932 (ppl 6.64)  val 1.8719 (ppl 6.50)  best 1.5163@2100 (39/-)
+[train] step  6000  loss 1.8973  lr 1.32e-04  grad 21.23  tok/s 199,925
+[train] step  6050  loss 1.8393  lr 1.30e-04  grad 53.16  tok/s 203,760
+[eval]  step  6100  train 1.8596 (ppl 6.42)  val 1.8263 (ppl 6.21)  best 1.5163@2100 (40/-)
+[train] step  6100  loss 1.8389  lr 1.28e-04  grad 84.32  tok/s 199,895
+[train] step  6150  loss 1.9414  lr 1.25e-04  grad 117.37  tok/s 203,749
+[eval]  step  6200  train 1.8287 (ppl 6.23)  val 1.8178 (ppl 6.16)  best 1.5163@2100 (41/-)
+[train] step  6200  loss 1.8408  lr 1.23e-04  grad 41.40  tok/s 199,952
+[train] step  6250  loss 1.9559  lr 1.21e-04  grad 65.57  tok/s 203,760
+[eval]  step  6300  train 1.8342 (ppl 6.26)  val 1.8078 (ppl 6.10)  best 1.5163@2100 (42/-)
+[train] step  6300  loss 1.8260  lr 1.19e-04  grad 55.27  tok/s 199,903
+[train] step  6350  loss 1.8662  lr 1.17e-04  grad 24.98  tok/s 203,728
+[eval]  step  6400  train 1.8615 (ppl 6.43)  val 1.8457 (ppl 6.33)  best 1.5163@2100 (43/-)
+[train] step  6400  loss 1.8628  lr 1.15e-04  grad 48.91  tok/s 199,898
+[train] step  6450  loss 1.7761  lr 1.13e-04  grad 20.51  tok/s 203,746
+[eval]  step  6500  train 1.7460 (ppl 5.73)  val 1.7332 (ppl 5.66)  best 1.5163@2100 (44/-)
+[train] step  6500  loss 1.7659  lr 1.11e-04  grad 30.50  tok/s 199,903
+[train] step  6550  loss 1.8295  lr 1.09e-04  grad 66.18  tok/s 203,729
+[eval]  step  6600  train 1.7949 (ppl 6.02)  val 1.7649 (ppl 5.84)  best 1.5163@2100 (45/-)
+[train] step  6600  loss 1.8166  lr 1.07e-04  grad 31.02  tok/s 199,911
+[train] step  6650  loss 1.8146  lr 1.05e-04  grad 44.36  tok/s 203,722
+[eval]  step  6700  train 1.7631 (ppl 5.83)  val 1.7458 (ppl 5.73)  best 1.5163@2100 (46/-)
+[train] step  6700  loss 1.7952  lr 1.03e-04  grad 51.20  tok/s 199,906
+[train] step  6750  loss 1.8227  lr 1.01e-04  grad 42.10  tok/s 203,715
+[eval]  step  6800  train 1.7813 (ppl 5.94)  val 1.7694 (ppl 5.87)  best 1.5163@2100 (47/-)
+[train] step  6800  loss 1.7855  lr 9.88e-05  grad 59.65  tok/s 199,950
+[train] step  6850  loss 1.9004  lr 9.69e-05  grad 77.21  tok/s 203,798
+[eval]  step  6900  train 2.0209 (ppl 7.54)  val 1.9969 (ppl 7.37)  best 1.5163@2100 (48/-)
+[train] step  6900  loss 2.0086  lr 9.49e-05  grad 43.68  tok/s 199,962
+[train] step  6950  loss 1.7976  lr 9.30e-05  grad 24.04  tok/s 203,744
+[eval]  step  7000  train 1.8021 (ppl 6.06)  val 1.7758 (ppl 5.91)  best 1.5163@2100 (49/-)
+[train] step  7000  loss 1.7924  lr 9.12e-05  grad 26.35  tok/s 199,947
+[train] step  7050  loss 1.7456  lr 8.93e-05  grad 25.49  tok/s 203,782
+[eval]  step  7100  train 1.7149 (ppl 5.56)  val 1.6872 (ppl 5.40)  best 1.5163@2100 (50/-)
+[train] step  7100  loss 1.7158  lr 8.75e-05  grad 17.02  tok/s 199,949
+[train] step  7150  loss 1.7460  lr 8.56e-05  grad 127.19  tok/s 203,762
+[eval]  step  7200  train 1.7673 (ppl 5.85)  val 1.7448 (ppl 5.72)  best 1.5163@2100 (51/-)
+[train] step  7200  loss 1.7642  lr 8.39e-05  grad 78.50  tok/s 199,947
+[train] step  7250  loss 1.8153  lr 8.21e-05  grad 99.95  tok/s 203,791
+[eval]  step  7300  train 1.8725 (ppl 6.50)  val 1.8698 (ppl 6.49)  best 1.5163@2100 (52/-)
+[train] step  7300  loss 1.8584  lr 8.03e-05  grad 76.04  tok/s 199,956
+[train] step  7350  loss 1.7536  lr 7.86e-05  grad 81.74  tok/s 203,732
+[eval]  step  7400  train 1.7503 (ppl 5.76)  val 1.7398 (ppl 5.70)  best 1.5163@2100 (53/-)
+[train] step  7400  loss 1.7710  lr 7.69e-05  grad 106.17  tok/s 199,885
+[train] step  7450  loss 1.8786  lr 7.52e-05  grad 397.24  tok/s 203,666
+[eval]  step  7500  train 1.8819 (ppl 6.57)  val 1.8682 (ppl 6.48)  best 1.5163@2100 (54/-)
+[train] step  7500  loss 1.8910  lr 7.36e-05  grad 1110.48  tok/s 199,842
+[train] step  7550  loss 2.7483  lr 7.19e-05  grad 2428.72  tok/s 203,697
+[eval]  step  7600  train 2.7077 (ppl 14.99)  val 2.6825 (ppl 14.62)  best 1.5163@2100 (55/-)
+[train] step  7600  loss 2.7349  lr 7.03e-05  grad 9928.13  tok/s 199,784
+[train] step  7650  loss 2.4693  lr 6.88e-05  grad 3016.17  tok/s 203,604
+[eval]  step  7700  train 2.2909 (ppl 9.88)  val 2.2518 (ppl 9.51)  best 1.5163@2100 (56/-)
+[train] step  7700  loss 2.2845  lr 6.72e-05  grad 4315.92  tok/s 199,810
+[train] step  7750  loss 2.1818  lr 6.57e-05  grad 14482.12  tok/s 203,669
+[eval]  step  7800  train 1.9433 (ppl 6.98)  val 1.9240 (ppl 6.85)  best 1.5163@2100 (57/-)
+[train] step  7800  loss 1.9627  lr 6.42e-05  grad 8739.14  tok/s 199,909
+[train] step  7850  loss 2.3518  lr 6.27e-05  grad 8387.69  tok/s 203,671
+[eval]  step  7900  train 2.3474 (ppl 10.46)  val 2.3152 (ppl 10.13)  best 1.5163@2100 (58/-)
+[train] step  7900  loss 2.3498  lr 6.13e-05  grad 10922.23  tok/s 199,790
+[train] step  7950  loss 2.5127  lr 5.99e-05  grad 9507.75  tok/s 203,582
+[eval]  step  8000  train 2.6111 (ppl 13.61)  val 2.5994 (ppl 13.46)  best 1.5163@2100 (59/-)
+[train] step  8000  loss 2.6076  lr 5.85e-05  grad 30453.94  tok/s 199,774
+[train] step  8050  loss 2.6633  lr 5.71e-05  grad 10402.23  tok/s 203,603
+[eval]  step  8100  train 2.5895 (ppl 13.32)  val 2.5697 (ppl 13.06)  best 1.5163@2100 (60/-)
+[train] step  8100  loss 2.5858  lr 5.58e-05  grad 63581.99  tok/s 199,761
+[train] step  8150  loss 2.4920  lr 5.45e-05  grad 42847.71  tok/s 203,597
+[eval]  step  8200  train 2.3679 (ppl 10.68)  val 2.3303 (ppl 10.28)  best 1.5163@2100 (61/-)
+[train] step  8200  loss 2.3611  lr 5.32e-05  grad 11890.44  tok/s 199,783
+[train] step  8250  loss 2.2714  lr 5.20e-05  grad 35758.33  tok/s 203,719
+[eval]  step  8300  train 2.3294 (ppl 10.27)  val 2.3047 (ppl 10.02)  best 1.5163@2100 (62/-)
+[train] step  8300  loss 2.3643  lr 5.08e-05  grad 42375.88  tok/s 199,872
+[train] step  8350  loss 2.2255  lr 4.96e-05  grad 27968.20  tok/s 203,681
+[eval]  step  8400  train 2.2901 (ppl 9.88)  val 2.2561 (ppl 9.55)  best 1.5163@2100 (63/-)
+[train] step  8400  loss 2.3033  lr 4.85e-05  grad 20587.88  tok/s 199,863
+[train] step  8450  loss 2.2232  lr 4.73e-05  grad 123089.88  tok/s 203,658
+[eval]  step  8500  train 2.3367 (ppl 10.35)  val 2.3180 (ppl 10.16)  best 1.5163@2100 (64/-)
+[train] step  8500  loss 2.3263  lr 4.63e-05  grad 121433.86  tok/s 199,870
+[train] step  8550  loss 2.3704  lr 4.52e-05  grad 107908.67  tok/s 203,666
+[eval]  step  8600  train 2.4618 (ppl 11.73)  val 2.4516 (ppl 11.61)  best 1.5163@2100 (65/-)
+[train] step  8600  loss 2.4806  lr 4.42e-05  grad 153389.84  tok/s 199,851
+[train] step  8650  loss 2.4033  lr 4.32e-05  grad 66755.00  tok/s 203,651
+[eval]  step  8700  train 2.3950 (ppl 10.97)  val 2.4147 (ppl 11.19)  best 1.5163@2100 (66/-)
+[train] step  8700  loss 2.4434  lr 4.23e-05  grad 92605.20  tok/s 199,830
+[train] step  8750  loss 2.4562  lr 4.14e-05  grad 102719.58  tok/s 203,649
+[eval]  step  8800  train 2.4871 (ppl 12.03)  val 2.4702 (ppl 11.82)  best 1.5163@2100 (67/-)
+[train] step  8800  loss 2.4971  lr 4.05e-05  grad 126259.10  tok/s 199,863
+[train] step  8850  loss 2.4883  lr 3.96e-05  grad 36772.67  tok/s 203,680
+[eval]  step  8900  train 2.4677 (ppl 11.79)  val 2.4487 (ppl 11.57)  best 1.5163@2100 (68/-)
+[train] step  8900  loss 2.4577  lr 3.88e-05  grad 43133.56  tok/s 199,818
+[train] step  8950  loss 2.5900  lr 3.81e-05  grad 42696.52  tok/s 203,744
+[eval]  step  9000  train 2.4122 (ppl 11.16)  val 2.4119 (ppl 11.16)  best 1.5163@2100 (69/-)
+[train] step  9000  loss 2.4302  lr 3.73e-05  grad 71128.40  tok/s 199,826
+[train] step  9050  loss 2.3805  lr 3.66e-05  grad 200959.88  tok/s 203,641
+[eval]  step  9100  train 2.4329 (ppl 11.39)  val 2.4052 (ppl 11.08)  best 1.5163@2100 (70/-)
+[train] step  9100  loss 2.4619  lr 3.59e-05  grad 34263.86  tok/s 199,855
+[train] step  9150  loss 2.4155  lr 3.53e-05  grad 129709.99  tok/s 203,672
+[eval]  step  9200  train 2.3509 (ppl 10.50)  val 2.3548 (ppl 10.54)  best 1.5163@2100 (71/-)
+[train] step  9200  loss 2.3521  lr 3.47e-05  grad 28476.22  tok/s 199,879
+[train] step  9250  loss 2.4081  lr 3.41e-05  grad 81495.76  tok/s 203,694
+[eval]  step  9300  train 2.3829 (ppl 10.84)  val 2.3403 (ppl 10.38)  best 1.5163@2100 (72/-)
+[train] step  9300  loss 2.3693  lr 3.36e-05  grad 215315.41  tok/s 199,880
+[train] step  9350  loss 2.3096  lr 3.31e-05  grad 146695.31  tok/s 203,676
+[eval]  step  9400  train 2.3325 (ppl 10.30)  val 2.3093 (ppl 10.07)  best 1.5163@2100 (73/-)
+[train] step  9400  loss 2.3389  lr 3.26e-05  grad 51400.00  tok/s 199,895
+[train] step  9450  loss 2.3799  lr 3.22e-05  grad 99973.33  tok/s 203,688
+[eval]  step  9500  train 2.3089 (ppl 10.06)  val 2.2652 (ppl 9.63)  best 1.5163@2100 (74/-)
+[train] step  9500  loss 2.3070  lr 3.18e-05  grad 118568.38  tok/s 199,853
+[train] step  9550  loss 2.2824  lr 3.15e-05  grad 189172.98  tok/s 203,687
+[eval]  step  9600  train 2.2883 (ppl 9.86)  val 2.2749 (ppl 9.73)  best 1.5163@2100 (75/-)
+[train] step  9600  loss 2.2938  lr 3.12e-05  grad 43590.89  tok/s 199,871
+[train] step  9650  loss 2.2956  lr 3.09e-05  grad 94872.31  tok/s 203,753
+[eval]  step  9700  train 2.4019 (ppl 11.04)  val 2.3928 (ppl 10.94)  best 1.5163@2100 (76/-)
+[train] step  9700  loss 2.3737  lr 3.07e-05  grad 156313.34  tok/s 199,911
+[train] step  9750  loss 2.2706  lr 3.05e-05  grad 59127.36  tok/s 203,701
+[eval]  step  9800  train 2.2800 (ppl 9.78)  val 2.2924 (ppl 9.90)  best 1.5163@2100 (77/-)
+[train] step  9800  loss 2.2905  lr 3.03e-05  grad 428294.38  tok/s 199,868
+[train] step  9850  loss 2.2825  lr 3.02e-05  grad 49823.27  tok/s 203,668
+[eval]  step  9900  train 2.2890 (ppl 9.87)  val 2.2747 (ppl 9.73)  best 1.5163@2100 (78/-)
+[train] step  9900  loss 2.3100  lr 3.01e-05  grad 220514.02  tok/s 199,846
+[train] step  9950  loss 2.2653  lr 3.00e-05  grad 76934.02  tok/s 203,666
+[eval]  step 10000  train 2.2629 (ppl 9.61)  val 2.2381 (ppl 9.38)  best 1.5163@2100 (79/-)
+[done] saved /home/cypher/a_repos/BrettCleary/mini-deepseek-v4/runs/pg19-gate-16k/final.pt  total 25998.4s
+[final] reloaded best.pt from step 2100
+[final] val: loss 1.5207  bpc 2.1940  ppl 4.58  (n_pos 5,062,656, windows 309)
+[final] test: loss 1.5556  bpc 2.2443  ppl 4.74  (n_pos 5,341,184, windows 326)
+=== 2026-09-03 02:19:37 training done; measuring the context curve ===
+  ...50/326 windows
+  ...100/326 windows
+  ...150/326 windows
+  ...200/326 windows
+  ...250/326 windows
+  ...300/326 windows
+
+pg19-gate-16k  |  test split  |  326 windows x 16384 positions  |  overall 2.2443 bpc
+
+   positions (context available) |     bpc | vs prev
+--------------------------------------------------------
+                        0-1024   |  2.2986 |         
+                     1024-2048   |  2.2497 |  -0.0490
+                     2048-3072   |  2.2583 |  +0.0086
+                     3072-4096   |  2.2320 |  -0.0263
+                     4096-5120   |  2.2213 |  -0.0107
+                     5120-6144   |  2.2322 |  +0.0109
+                     6144-7168   |  2.2258 |  -0.0064
+                     7168-8192   |  2.2229 |  -0.0029
+                     8192-9216   |  2.2180 |  -0.0049
+                     9216-10240  |  2.2173 |  -0.0007
+                    10240-11264  |  2.2493 |  +0.0320
+                    11264-12288  |  2.2294 |  -0.0199
+                    12288-13312  |  2.2299 |  +0.0005
+                    13312-14336  |  2.2521 |  +0.0222
+                    14336-15360  |  2.2642 |  +0.0120
+                    15360-16384  |  2.3073 |  +0.0431
+
+  early window (2048-4096):  2.2452 bpc
+  late  window (14336-16384):  2.2857 bpc
+  gain from 4096 -> 16384 tokens of context: -0.0406 bpc
+
+=== enwiki8 reference (stage-e-v3-2-vanilla-16k), same model and budget ===
+  0-1024 1.683 | 1024-2048 1.561 | 2048-3072 1.581 | 8192-9216 1.569 | 15360-16384 1.541
+  i.e. flat past ~2K; 4K->16K of context was worth only ~0.04 bpc.

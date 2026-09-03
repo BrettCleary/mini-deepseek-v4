@@ -128,12 +128,48 @@ the entire gap the tables above report.
 Implemented as `--csa-n-win` (§2.3.3; DeepSeek-V4 uses `n_win = 128` at `m = 4`,
 §4.2.1). See notes.md D7 for the design choices where the paper is ambiguous.
 
-**The two known confounds push in opposite directions**, which is why the
-tables above cannot be corrected by inspection:
+### The largest confound: only one arm had QK-norm
+
+`CSAAttention` has applied RMSNorm to queries and compressed KV entries since
+Stage 2 — paper §2.3.3, whose stated purpose is that it "avoids exploding
+attention logits and may improve training stability".
+`VanillaMultiHeadAttention` had none; it went straight from the qkv projection
+into SDPA. D4 was careful to give both arms the same positional encoding, but
+normalization was never equalized.
+
+With `--grad-clip 1.0`, and `grad_norm` logged pre-clip:
+
+| arm | ctx | median grad norm | steps clipped | effective LR |
+| --- | --- | --- | --- | --- |
+| vanilla | 1K | 0.52 | 10.8% | ×1.00 |
+| vanilla | 2K | 0.77 | 41.5% | ×1.00 |
+| vanilla | 8K | 10.69 | **91.0%** | **×0.094** |
+| vanilla | 16K | 15.42 | **94.0%** | **×0.065** |
+| CSA | 1K | 0.58 | 0.3% | ×1.00 |
+| CSA | 2K | 0.52 | 0.8% | ×1.00 |
+| CSA | 8K | 0.62 | 17.6% | ×1.00 |
+
+Vanilla's gradient norms grow with context; CSA's do not. At 8K and 16K the
+baseline was taking steps roughly a tenth of their nominal size while CSA ran
+essentially unclipped. This is arm-asymmetric *and* context-dependent, biting
+hardest exactly where the study's claim lives, and it plausibly accounts for
+vanilla early-stopping at 20-31% of its cap at long context, for vanilla bpc
+worsening with context in all three sweeps, and for much of v3.1's apparent
+gap collapse at 8K.
+
+It surfaced when the pg19 gate run diverged outright (gradient norms reaching
+4.3e5, best val at step 2100 of 10000, then ~50% degradation). Fixed by adding
+QK-RMSNorm to the dense baseline — `--vanilla-qk-norm`, on by default, with
+`--no-vanilla-qk-norm` to reproduce earlier runs. **Every arm comparison in the
+tables on this page predates the fix.**
+
+**The three known confounds do not share a direction**, which is why those
+tables cannot be corrected by inspection:
 
 | confound | flatters | reported gap is therefore |
 | --- | --- | --- |
 | LR anneal tied to the cap (CSA got 51-93% of its schedule, vanilla 20-31%) | CSA | too **narrow** |
+| QK-norm on CSA only (vanilla at ~1/10 effective LR at 8K-16K) | CSA | too **narrow** |
 | recency hole (~0.5 bpc) | vanilla | too **wide** |
 
 ### The context axis is nearly inert on this dataset
@@ -221,6 +257,23 @@ yields a usable curve.
 
 Progress is in `runs/pg19-gate-16k/log.jsonl` (the `.log` file stays empty
 until the process exits, since Python buffers stdout when it is not a TTY).
+
+**The first attempt diverged and answered nothing.** Gradient norms grew from
+0.3 to 4.3e5, best val landed at step 2100 of 10000, and everything after that
+degraded by ~50%; `train_bpc` tracked `val_bpc` throughout, so it was
+optimization blowup rather than overfitting. The position curve it produced
+came from a checkpoint 21% into the anneal and is not evidence about pg19.
+Two fixes went in before any re-run:
+
+- QK-RMSNorm in the dense baseline (above) — the root cause.
+- The pg19 byte vocab is now built from **train counts only**, with values
+  under `PG19_MIN_TRAIN_COUNT` folded into one `<rare>` id. Previously the
+  vocab came from the union of splits, so 4 byte values appeared in test having
+  never occurred in train, and 18 occurred fewer than 10 times — untrained
+  embedding rows under weight tying, each occurrence producing a large gradient
+  on a near-init row. Vocab 170 → 126; the folded tail is 0.0013% of the
+  corpus. enwiki8 is deliberately left alone (min train count 2, nothing
+  test-only) so its existing runs stay reproducible.
 
 ### What CSA is actually claiming
 

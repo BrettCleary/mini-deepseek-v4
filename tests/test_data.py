@@ -123,3 +123,46 @@ def test_eval_windows_restart_at_every_document():
 def test_sampler_rejects_block_size_no_document_can_hold():
     with pytest.raises(ValueError):
         _sampler([10, 20], block_size=64)
+
+
+# ---------------------------------------------------------------------------
+# Byte vocab with the untrainable tail folded (pg19).
+# ---------------------------------------------------------------------------
+
+
+def test_build_byte_vocab_folds_the_rare_tail():
+    # 'a' x 500, 'b' x 200, 'c' x 3  -> 'c' is below threshold and folds.
+    train = b"a" * 500 + b"b" * 200 + b"c" * 3
+    lut, stoi, itos, vocab_size = data.build_byte_vocab(train, min_count=100)
+    assert vocab_size == 3                      # a, b, <rare>
+    assert set(stoi) == {ord("a"), ord("b")}
+    rare = vocab_size - 1
+    assert lut[ord("c")] == rare
+    assert lut[ord("a")] != rare and lut[ord("b")] != rare
+
+
+def test_unseen_bytes_map_to_rare_not_to_an_untrained_row():
+    """The actual bug: 4 byte values appeared in pg19's test split but never in
+    train, so their embedding rows were pure init at evaluation time."""
+    train = b"x" * 1000
+    lut, _, _, vocab_size = data.build_byte_vocab(train, min_count=10)
+    rare = vocab_size - 1
+    for b in (0, 7, 200, 255):
+        assert lut[b] == rare
+    assert lut[ord("x")] == 0
+
+
+def test_vocab_ids_are_contiguous_and_cover_all_bytes():
+    train = bytes(range(256)) * 50
+    lut, stoi, itos, vocab_size = data.build_byte_vocab(train, min_count=10)
+    assert vocab_size == 257                     # all 256 kept, plus <rare>
+    assert sorted(stoi.values()) == list(range(256))
+    assert lut.min() >= 0 and lut.max() < vocab_size
+    assert set(itos) == set(range(vocab_size))
+
+
+def test_min_count_of_one_keeps_everything_seen():
+    train = b"ab" + b"c"
+    _, stoi, _, vocab_size = data.build_byte_vocab(train, min_count=1)
+    assert set(stoi) == {ord("a"), ord("b"), ord("c")}
+    assert vocab_size == 4                       # + <rare> for unseen bytes

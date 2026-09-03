@@ -43,6 +43,10 @@ class TrainConfig:
     csa_c_i: int = 0        # 0 -> csa_c // 2
     csa_n_h_i: int = 0      # 0 -> max(2, n_heads // 2)
     csa_d_c: int = 0        # 0 -> d_model // 2
+    # QK-RMSNorm in the dense baseline, matching CSA's q_norm/k_norm. On by
+    # default; --no-vanilla-qk-norm reproduces pre-2026-09 runs. See ModelConfig.
+    vanilla_qk_norm: bool = True
+
     csa_top_k: int = 16     # eval-time top-k blocks per query
     # Sliding-window branch (paper 2.3.3 / Fig 3): each query also attends to
     # the csa_n_win most recent uncompressed tokens. 0 disables it. DeepSeek-V4
@@ -101,7 +105,12 @@ def parse_args() -> TrainConfig:
         default = getattr(cfg, f.name)
         flag = f"--{f.name.replace('_', '-')}"
         if isinstance(default, bool):
-            p.add_argument(flag, action="store_true", default=default)
+            # BooleanOptionalAction gives both --flag and --no-flag, so a
+            # True-by-default option (vanilla_qk_norm) can still be turned off
+            # — needed to reproduce runs made before it existed.
+            p.add_argument(
+                flag, action=argparse.BooleanOptionalAction, default=default
+            )
         else:
             p.add_argument(flag, default=default, type=type(default))
     ns = p.parse_args()
@@ -413,6 +422,7 @@ def train(cfg: TrainConfig) -> None:
         csa_top_k=cfg.csa_top_k,
         csa_chunk=cfg.csa_chunk,
         csa_n_win=cfg.csa_n_win,
+        vanilla_qk_norm=cfg.vanilla_qk_norm,
     )
     m = model.MiniTransformer(mcfg).to(device)
     if cfg.compile:

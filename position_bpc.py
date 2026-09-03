@@ -40,6 +40,15 @@ def main() -> None:
     # Tolerate checkpoints written before newer ModelConfig fields existed.
     known = set(model.ModelConfig.__dataclass_fields__)
     mcfg = model.ModelConfig(**{k: v for k, v in cfg_dict.items() if k in known})
+    # Checkpoints written before vanilla QK-norm existed have no q_norm/k_norm
+    # weights, and their saved config predates the field, so the dataclass
+    # default (True) would build an architecture the state dict cannot fill.
+    # Infer it from the weights instead.
+    if mcfg.attention == "vanilla" and "vanilla_qk_norm" not in cfg_dict:
+        has_norm = any(".attn.q_norm." in k for k in ckpt["model_state"])
+        if mcfg.vanilla_qk_norm != has_norm:
+            print(f"[compat] checkpoint predates vanilla_qk_norm; using {has_norm}")
+            mcfg.vanilla_qk_norm = has_norm
     m = model.MiniTransformer(mcfg).to(device)
     m.load_state_dict(ckpt["model_state"])
     m.eval()

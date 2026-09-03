@@ -45,6 +45,18 @@ class ModelConfig:
     csa_c_i: int | None = None    # indexer head dim. Defaults to csa_c // 2.
     csa_n_h_i: int | None = None  # indexer query heads. Defaults to max(2, n_heads // 2).
     csa_d_c: int | None = None    # shared query latent dim. Defaults to d_model // 2.
+    # RMSNorm on queries and keys in the dense baseline. CSA has had this from
+    # the start (paper §2.3.3: "avoids exploding attention logits and may
+    # improve training stability"); vanilla did not, which handed CSA an
+    # arm-asymmetric stability advantage that grows with context. Measured on
+    # the pre-fix runs, with --grad-clip 1.0: vanilla's median gradient norm
+    # was 10.7 at 8K and 15.4 at 16K (clipped on 91% / 94% of steps, i.e. an
+    # effective LR ~1/10 of nominal), while CSA sat at ~0.6 and was essentially
+    # never clipped. Default on: this is what makes the baseline fair, and
+    # QK-norm is standard for dense attention. Pass --no-vanilla-qk-norm to
+    # reproduce the older runs.
+    vanilla_qk_norm: bool = True
+
     csa_top_k: int = 16           # eval-time top-k blocks per query (D3).
     # Paper §2.3.3 "Additional Branch of Sliding Window Attention": each query
     # additionally attends to the `csa_n_win` most recent *uncompressed* tokens,
@@ -131,11 +143,20 @@ class VanillaMultiHeadAttention(nn.Module):
         self.head_dim = cfg.head_dim
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # Per-head QK normalisation, mirroring CSAAttention's q_norm / k_norm
+        # so the two arms differ in attention mechanism and nothing else.
+        self.qk_norm = cfg.vanilla_qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(cfg.head_dim)
+            self.k_norm = RMSNorm(cfg.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, n, _ = x.shape
         qkv = self.qkv(x).view(b, n, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)            # each: (b, n, h, d_h)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # (b, h, n, d_h)
         # PyTorch's SDPA picks flash / mem-efficient kernels when available.
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
