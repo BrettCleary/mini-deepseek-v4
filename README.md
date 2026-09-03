@@ -211,6 +211,17 @@ passes the gate:** train one vanilla model at long context and check
 and it is the control that Stage E never had. If the curve is flat again, the
 dataset is not the fix and code is the next candidate.
 
+`run_pg19_gate.sh` runs exactly that. It is configured to match
+`stage-e-v3-2-vanilla-16k` in every respect — model, context, batch,
+grad-accum, warmup, LR endpoints, seed, iteration count — so the only
+difference between the two position curves is the dataset. Measured on an
+RTX 5070 Ti: 199K tok/s at 16K, 2.20 GiB peak, ~7.6h for the full 10000 iters.
+`best.pt` is written on every val improvement, so an interrupted run still
+yields a usable curve.
+
+Progress is in `runs/pg19-gate-16k/log.jsonl` (the `.log` file stays empty
+until the process exits, since Python buffers stdout when it is not a TTY).
+
 ### What CSA is actually claiming
 
 Worth stating plainly, because it sets the target. DeepSeek-V4 introduces CSA
