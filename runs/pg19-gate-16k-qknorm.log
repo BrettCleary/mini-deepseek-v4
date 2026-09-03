@@ -1,0 +1,10 @@
+[setup] device=cuda
+[data] pg19 vocab=126 (131 byte values folded into <rare>, 3,712 occurrences across all splits)
+[data]  pg19  vocab=126, train=90,330,851 tokens, val=5,220,809, test=5,433,972
+[data]  document-aware sampling: 225 train documents long enough for block_size=16384 (86,597,916 distinct windows)
+[model] vanilla, params=16,962,432 (excl emb=10,622,592)
+[run]   logging to /home/cypher/a_repos/BrettCleary/mini-deepseek-v4/runs/pg19-gate-16k-qknorm
+[opt]   amp=bf16, grad_accum_steps=32, effective_batch=32
+[lr]    cosine, warmup=500, horizon=10000, 3.00e-04 -> 3.00e-05
+[eval]  step     0  train 4.9396 (ppl 139.72)  val 4.9586 (ppl 142.39)  best 4.9586@0 (0/-)
+[train] step    50  loss 3.2326  lr 3.06e-05  grad 2.11  tok/s 171,447

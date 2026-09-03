@@ -21,14 +21,34 @@
 #
 # best.pt is written on every val improvement, so killing this early still
 # leaves a usable checkpoint -- position_bpc.py reads best.pt.
+#
+# Attempt 1 (runs/pg19-gate-16k) diverged: gradient norms 0.3 -> 4.3e5, best val
+# at step 2100 of 10000, ~50% degradation after. Root cause was the dense
+# baseline lacking the QK-RMSNorm that CSA has had since Stage 2, plus a pg19
+# vocab built over the union of splits. Both are fixed; this run has
+# --vanilla-qk-norm on by default and vocab 126 built from train counts only.
+#
+# CAVEAT on the enwiki8 reference printed at the end: that run predates
+# QK-norm, so it is matched on dataset-independent hyperparameters but NOT on
+# architecture. It was also clipped on 94% of its steps (effective LR ~x0.065)
+# and was still improving at its cap, so its flat curve may reflect an
+# undertrained model rather than enwiki8. Re-run it with QK-norm before
+# treating the cross-dataset comparison as sound.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PY=.venv/bin/python
-RUN=pg19-gate-16k
+RUN=pg19-gate-16k-qknorm
 
-$PY train.py \
+# Never clobber a previous attempt: runs/pg19-gate-16k holds the diverged first
+# run, whose log.jsonl is the evidence for the QK-norm gradient-clipping table.
+if [ -e "runs/$RUN" ]; then
+    echo "runs/$RUN already exists; pick a new RUN or move it aside." >&2
+    exit 1
+fi
+
+$PY -u train.py \
     --attention vanilla \
     --run-name "$RUN" \
     --dataset pg19 \
@@ -43,9 +63,11 @@ $PY train.py \
     --amp bf16 --seed 1337
 
 echo "=== $(date '+%F %T') training done; measuring the context curve ==="
-$PY position_bpc.py "runs/$RUN" --buckets 16 | tee "runs/$RUN/position_bpc.txt"
+$PY -u position_bpc.py "runs/$RUN" --buckets 16 | tee "runs/$RUN/position_bpc.txt"
 
 echo
 echo "=== enwiki8 reference (stage-e-v3-2-vanilla-16k), same model and budget ==="
 echo "  0-1024 1.683 | 1024-2048 1.561 | 2048-3072 1.581 | 8192-9216 1.569 | 15360-16384 1.541"
 echo "  i.e. flat past ~2K; 4K->16K of context was worth only ~0.04 bpc."
+echo "  NOTE: that run predates QK-norm and was clipped on 94% of steps."
+echo "  Architecture-mismatched reference -- see the caveat at the top of this script."
