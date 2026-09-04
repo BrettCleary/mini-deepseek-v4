@@ -258,6 +258,44 @@ yields a usable curve.
 Progress is in `runs/pg19-gate-16k/log.jsonl` (the `.log` file stays empty
 until the process exits, since Python buffers stdout when it is not a TTY).
 
+**Result (2026-09-04): pg19 does not rescue the design.** With QK-norm and the
+vocab fix, the run was healthy — gradient norms flat at 0.33-0.50 for all 10000
+steps, best val 1.4918 bpc at step 9700, anneal completed. So this is a
+well-trained model, and the earlier "maybe it was just undertrained" escape
+hatch is closed.
+
+| positions (context available) | bpc |
+| --- | --- |
+| 0-1024 | 1.654 |
+| 1024-2048 | 1.546 |
+| 2048-3072 | 1.549 |
+| 4096-5120 | 1.524 |
+| 8192-9216 | 1.517 |
+| 12288-13312 | 1.512 |
+| 15360-16384 | 1.513 |
+
+One drop over the first ~2K, then a slow drift. A paired per-window test (early
+slice 2-4K of context vs late slice 14-16K, pairing removes between-window
+difficulty variation) gives **+0.0240 ± 0.0086 bpc, t = 2.8**, with 60% of
+windows improving.
+
+So the context axis on pg19 is *real but negligible*: statistically detectable,
+and worth 0.024 bpc for an **8x** increase in context. The architecture
+differences this repo set out to measure are 0.13-1.07 bpc — 5 to 45 times
+larger than the entire budget available on the axis being varied. Every
+confound found so far (LR horizon 0.144 bpc, recency hole ~0.5 bpc, QK-norm
+larger still) also dwarfs it.
+
+Two datasets, one of them the standard long-range LM benchmark with a
+properly-trained model, give the same answer: **at ~10M parameters and
+byte-level granularity, long context does not buy enough for a long-context
+architecture comparison to be measurable.**
+
+What remains genuinely open is whether that is the *model* or the *data*. A
+synthetic task with a planted, guaranteed long-range dependency at controlled
+distance would separate them: if a 10M byte-level model cannot exploit a
+dependency it is guaranteed to need, no dataset change will help.
+
 **The first attempt diverged and answered nothing.** Gradient norms grew from
 0.3 to 4.3e5, best val landed at step 2100 of 10000, and everything after that
 degraded by ~50%; `train_bpc` tracked `val_bpc` throughout, so it was
