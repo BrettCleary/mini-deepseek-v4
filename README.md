@@ -279,22 +279,53 @@ slice 2-4K of context vs late slice 14-16K, pairing removes between-window
 difficulty variation) gives **+0.0240 ± 0.0086 bpc, t = 2.8**, with 60% of
 windows improving.
 
-So the context axis on pg19 is *real but negligible*: statistically detectable,
-and worth 0.024 bpc for an **8x** increase in context. The architecture
-differences this repo set out to measure are 0.13-1.07 bpc — 5 to 45 times
-larger than the entire budget available on the axis being varied. Every
-confound found so far (LR horizon 0.144 bpc, recency hole ~0.5 bpc, QK-norm
-larger still) also dwarfs it.
+So the *average* gain is 0.024 bpc for an 8x increase in context. **That average
+turns out to be the wrong statistic**, and the conclusion first drawn from it —
+that the context axis is inert — was wrong.
 
-Two datasets, one of them the standard long-range LM benchmark with a
-properly-trained model, give the same answer: **at ~10M parameters and
-byte-level granularity, long context does not buy enough for a long-context
-architecture comparison to be measurable.**
+### The value of long context is real, and concentrated in ~1% of tokens
 
-What remains genuinely open is whether that is the *model* or the *data*. A
-synthetic task with a planted, guaranteed long-range dependency at controlled
-distance would separate them: if a 10M byte-level model cannot exploit a
-dependency it is guaranteed to need, no dataset change will help.
+`context_value.py` scores each token twice on sequences identical in length,
+absolute positions and local context, differing only in whether the *distant*
+context carries real information: bytes before offset `--corrupt-before` are
+replaced with prose from another book. On `pg19-gate-16k-qknorm`, corrupting
+everything before byte 8192 and scoring positions 12288+ (327,680 positions):
+
+| statistic | value |
+| --- | --- |
+| mean gain | +0.0226 bpc |
+| **median gain** | **+0.0002 bpc** |
+| tokens helped / hurt | 54.2% / 45.8% |
+| gaining > 1 bit | **0.96%** of tokens, carrying **79%** of all bits gained |
+| top 1% of tokens | **+1.83 bpc each**, 81% of the total |
+
+The mean agrees with the position-curve measurement (+0.024), so the two
+independent methods corroborate each other. But the median is zero: the typical
+byte gains nothing from 8K of extra context, and roughly 1% of tokens gain
+~1.8 bits each. Averaging over the other 99% dilutes a large effect by ~80x.
+
+**This changes what the study should measure, and revives it.** Mean bpc is a
+poor instrument for a long-context question. On the subpopulation that actually
+depends on distant retrieval, the effect is ~1.8 bpc — comfortably *larger*
+than every confound found here (LR horizon 0.144, recency hole ~0.5, QK-norm
+~0.7), rather than 5-45x smaller. The CSA question also sharpens: on the tokens
+that need a distant block, does the lightning indexer's top-k select it? That is
+a direct test of CSA's actual novel component.
+
+#### Two measurement designs that failed first
+
+Recorded because both produced confident nonsense — "gains" of 4+ bpc, larger
+than the model's entire bpc:
+
+- **Masking attention to a short window at eval.** A model trained with full
+  attention is far off-distribution when attention is restricted.
+- **Re-feeding only the recent bytes as their own sequence.** Worse: the
+  sequence then has no position-0 token, and transformers depend on an
+  early-token attention sink, so the model collapses to near-random (5.70 bpc
+  against 6.98 for a uniform guess over this 126-value vocab).
+
+Substituting real text from another document keeps length, positions and the
+sink intact, so only information content changes.
 
 **The first attempt diverged and answered nothing.** Gradient norms grew from
 0.3 to 4.3e5, best val landed at step 2100 of 10000, and everything after that
