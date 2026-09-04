@@ -420,6 +420,15 @@ largest remaining lever, if it is still tight, is computing the core softmax in
 bf16 (~9GB at 16K), but that changes numerics mid-study and should be a last
 resort.
 
+## Paper
+
+`paper/main.tex` — *What Transfers and What Does Not: Reproducing Compressed
+Sparse Attention at Single-GPU Scale*. Build with `latexmk -pdf main.tex`.
+Every table in it is reproduced by a script in this repo:
+`feasibility.py` (training feasibility, KV cache), `context_value.py` (metric
+dilution), `position_bpc.py` (context curve), and the run logs under `runs/`
+(sweeps, gradient norms).
+
 ## Setup
 
 Requires Python 3.12 and a CUDA GPU.
